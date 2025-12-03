@@ -1,0 +1,31 @@
+# GdogTAK Repository .gitignore
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE settings (if opening repo root in an editor)
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+venv/
+.env
+
+# Compiled outputs
+*.apk
+*.aab
+*.ipa
+
+# Logs
+*.log
+
+# Local test data (don't commit real captures with personal coordinates)
+/captures/
+/test-data/
