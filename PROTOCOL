@@ -1,0 +1,417 @@
+# Garmin Alpha BLE Protocol Documentation
+
+This document describes what we've learned about the Bluetooth Low Energy (BLE) protocol used by Garmin Alpha dog tracking handhelds to communicate with smartphones.
+
+**Last Updated**: December 2024  
+**Hardware Tested**: Alpha 300i + TT25 collar  
+**Status**: Partial decode — position data confirmed working
+
+---
+
+## Table of Contents
+
+1. [The Simple Version](#the-simple-version) — For those who just want to understand what's happening
+2. [Technical Deep-Dive](#technical-deep-dive) — For developers who want to implement this
+3. [Raw Data Analysis](#raw-data-analysis) — The actual bytes and how we decoded them
+4. [Open Questions](#open-questions) — What we haven't figured out yet
+
+---
+
+# The Simple Version
+
+## How Garmin Alpha Dog Tracking Works
+
+The Garmin Alpha system has three main components:
+
+```
+🐕 TT25 Collar                    📱 Alpha 300i Handheld              📲 Your Phone
+   (on the dog)                      (in your hand)                    (running ATAK)
+        │                                  │                                │
+        │  VHF Radio (151-152 MHz)        │                                │
+        │  Range: up to 9 miles           │                                │
+        │  Update: every 2.5 seconds      │                                │
+        ▼                                  │                                │
+   GPS coordinates ──────────────────────▶ │                                │
+                                          │                                │
+                                          │  Bluetooth LE                  │
+                                          │  Range: ~30 feet               │
+                                          │  (to Garmin app normally)      │
+                                          ▼                                │
+                                    Dog positions ─────────────────────────▶
+                                    (what we're capturing)
+```
+
+**The problem**: Garmin's app receives the dog positions over Bluetooth, but there's no way to get that data into TAK. Garmin doesn't offer an API.
+
+**Our solution**: We figured out how Garmin encodes the positions in the Bluetooth data, so we can read it directly and convert it to TAK format.
+
+## What We Discovered
+
+### The Bluetooth Connection
+
+When your phone connects to the Alpha 300i via Bluetooth, the Alpha exposes several "services" — think of these as different channels for different types of data:
+
+| Service | What It Does |
+|---------|--------------|
+| Battery Service | Reports the handheld's battery level |
+| Generic Access | Basic device info (name, etc.) |
+| **Garmin Multi-Link** | 🎯 This is where the good stuff is |
+
+The Garmin Multi-Link service is proprietary. It's how the Alpha sends position data for the handheld AND all connected dog collars.
+
+### How Positions Are Encoded
+
+GPS coordinates are normally written as decimal degrees, like:
+
+```
+Latitude:  43.741722°
+Longitude: -116.010025°
+```
+
+But Garmin doesn't send them that way. They use something called "semicircles" — a format that's more efficient for computers:
+
+```
+Latitude in semicircles:  519913472
+Longitude in semicircles: -1379565825
+```
+
+To convert semicircles back to degrees, you multiply by (180 ÷ 2,147,483,648).
+
+The data is also compressed using a format called "Protocol Buffers" (protobuf), which is a Google-invented way to pack data tightly.
+
+### How We Tell Dog from Handler
+
+This was the key insight: each position message includes a marker byte that tells us what device it came from.
+
+| Marker Value | Device |
+|--------------|--------|
+| `0x28` (40 decimal) | Handheld (the Alpha itself) |
+| `0x35` (53 decimal) | Dog collar (TT25, etc.) |
+
+So when we see `0x35` in the right place, we know those coordinates are the dog's position, not the handler's.
+
+### What the Data Looks Like
+
+Here's a simplified view of a dog collar position message:
+
+```
+[Header stuff] [Device=0x35] [More header] [Lat=519913472] [Lon=-1379565825] [Timestamp] [Extra data]
+     ↓               ↓                            ↓                                ↓
+  Protocol       "This is                   "Dog is at                      Speed, heading,
+  overhead       a collar"                  43.74°, -116.01°"                or status?
+```
+
+## What This Means for You
+
+If you want to get dog positions into TAK, you need:
+
+1. **A phone with Bluetooth LE** — Connects to the Alpha 300i
+2. **Software that speaks Garmin's protocol** — Subscribes to position updates
+3. **A parser** — Decodes the semicircles and protobuf into lat/lon
+4. **TAK integration** — Converts to CoT format and sends to ATAK/TAK Server
+
+We've built a prototype of steps 2-4 in Python. The Android app (step 1 + all the rest) is in development.
+
+---
+
+# Technical Deep-Dive
+
+## BLE Service Architecture
+
+### Service UUID
+```
+6a4e2800-667b-11e3-949a-0800200c9a66
+```
+
+This is the Garmin Multi-Link (ML) service. It's the same service used by Garmin watches, fitness trackers, and apparently dog tracking handhelds.
+
+### Characteristics
+
+| UUID | Properties | Purpose |
+|------|------------|---------|
+| `6a4e2803-...` | READ, WRITE | Control/configuration |
+| `6a4e2810-...` | READ, WRITE, NOTIFY | Data channel 0 |
+| `6a4e2820-...` | WRITE | Write queue for channel 0 |
+| `6a4e2811-...` | READ, WRITE, NOTIFY | Data channel 1 |
+| `6a4e2821-...` | WRITE | Write queue for channel 1 |
+| `6a4e2813-...` | NOTIFY | 🎯 **Position updates come here** |
+
+For dog tracking, **subscribe to `6a4e2813`** and you'll receive notifications containing position data.
+
+## Multi-Link Protocol Overview
+
+Garmin's Multi-Link protocol is a multiplexer that carries multiple logical services over the same BLE characteristics. It's documented (partially) by the Gadgetbridge project.
+
+### Message Structure
+
+```
+┌──────────┬──────────────────────────────────────────┐
+│  Header  │              Payload                     │
+│ (2 bytes)│         (variable length)                │
+└──────────┴──────────────────────────────────────────┘
+     │
+     ├── Byte 0: Handle/flags (MLR uses 0xE0+ range)
+     └── Byte 1: Sequence/control
+```
+
+For dog tracking messages, we see headers in the `0xE0`-`0xEF` range, indicating Multi-Link Reliable (MLR) protocol.
+
+### Position Message Structure
+
+Based on our capture analysis, position messages follow this pattern:
+
+```
+Offset  Bytes           Meaning
+------  --------------  ------------------------------------------
+0-1     E7 3B           MLR header (handle + sequence)
+2-3     00 02           Message type indicator
+4       49 or 3C        Payload length (0x49=73 bytes for collar)
+5-6     05 2B           Protocol markers
+7-8     XX XX           Message sequence number
+9       11              Field separator
+10-11   01 01           Unknown (always 01 01)
+12      01              Unknown
+13      02              Field type for device marker
+14      35 or 28        🎯 DEVICE TYPE (0x35=collar, 0x28=handheld)
+15-16   01 01           Unknown
+17      02              Field type (repeated pattern)
+18      35 or 28        Device type (repeated)
+...
+~28     0A 0C 08        Start of coordinate block
+~31+    [varint]        Latitude (zigzag-encoded semicircles)
+        10              Longitude field marker
+        [varint]        Longitude (zigzag-encoded semicircles)
+        18              Timestamp field marker  
+        [varint]        Timestamp (format TBD)
+```
+
+## Coordinate Decoding
+
+### Varint Decoding
+
+Protocol Buffers use variable-length integers (varints). Each byte uses 7 bits for data and 1 bit to indicate continuation:
+
+```python
+def decode_varint(data: bytes, offset: int) -> tuple[int, int]:
+    """Returns (value, bytes_consumed)"""
+    result = 0
+    shift = 0
+    consumed = 0
+    while True:
+        byte = data[offset + consumed]
+        result |= (byte & 0x7F) << shift
+        consumed += 1
+        if not (byte & 0x80):  # High bit clear = last byte
+            break
+        shift += 7
+    return result, consumed
+```
+
+### ZigZag Decoding (for signed integers)
+
+Protobuf encodes signed integers using ZigZag encoding, which maps negative numbers to positive ones:
+
+```python
+def decode_sint32(varint: int) -> int:
+    """ZigZag decode"""
+    return (varint >> 1) ^ -(varint & 1)
+```
+
+### Semicircles to Degrees
+
+```python
+def semicircles_to_degrees(sc: int) -> float:
+    """Convert Garmin semicircles to decimal degrees"""
+    return sc * (180.0 / 2147483648.0)  # 2^31
+```
+
+### Complete Coordinate Extraction
+
+```python
+def extract_coordinates(data: bytes) -> tuple[float, float] | None:
+    """
+    Find and decode coordinates in a Garmin position message.
+    Returns (latitude, longitude) in decimal degrees, or None.
+    """
+    # Look for the coordinate block signature: 0A 0C 08
+    for i in range(len(data) - 15):
+        if data[i:i+3] == b'\x0A\x0C\x08':
+            # Decode latitude
+            lat_varint, lat_len = decode_varint(data, i + 3)
+            lat_signed = decode_sint32(lat_varint)
+            
+            # Check for longitude marker (0x10)
+            lon_offset = i + 3 + lat_len
+            if data[lon_offset] != 0x10:
+                continue
+            
+            # Decode longitude
+            lon_varint, lon_len = decode_varint(data, lon_offset + 1)
+            lon_signed = decode_sint32(lon_varint)
+            
+            # Convert to degrees
+            lat = semicircles_to_degrees(lat_signed)
+            lon = semicircles_to_degrees(lon_signed)
+            
+            # Sanity check
+            if -90 <= lat <= 90 and -180 <= lon <= 180:
+                return (lat, lon)
+    
+    return None
+```
+
+## Device Type Detection
+
+To distinguish collar positions from handheld positions:
+
+```python
+def is_collar_message(data: bytes) -> bool:
+    """Check if this message contains dog collar position data."""
+    COLLAR_MARKER = 0x35
+    HANDHELD_MARKER = 0x28
+    
+    # Look for device marker pattern: 02 XX 01
+    for i in range(min(len(data) - 3, 25)):
+        if data[i] == 0x02 and data[i+2] == 0x01:
+            if data[i+1] == COLLAR_MARKER:
+                return True
+            elif data[i+1] == HANDHELD_MARKER:
+                return False
+    
+    return False  # Unknown
+```
+
+## CoT Generation
+
+Once you have coordinates, generating Cursor-on-Target XML is straightforward:
+
+```python
+def generate_dog_cot(lat: float, lon: float, callsign: str, uid: str) -> str:
+    """Generate CoT XML for a dog position."""
+    from datetime import datetime, timezone
+    
+    now = datetime.now(timezone.utc)
+    time_str = now.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    stale = now.replace(second=now.second + 30)
+    stale_str = stale.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    
+    return f'''<?xml version="1.0" encoding="UTF-8"?>
+<event version="2.0" uid="{uid}" type="a-f-G-U-C-I" 
+       time="{time_str}" start="{time_str}" stale="{stale_str}" how="m-g">
+    <point lat="{lat:.7f}" lon="{lon:.7f}" hae="0" ce="10" le="10"/>
+    <detail>
+        <contact callsign="{callsign}"/>
+        <remarks>SAR K9 - Garmin Collar</remarks>
+    </detail>
+</event>'''
+```
+
+---
+
+# Raw Data Analysis
+
+## Sample Messages from Capture
+
+### Handheld Position (65 bytes)
+
+```
+E7 3A 00 02 3C 05 2B 94 1E 11 01 01 01 02 28 01
+01 02 28 01 01 2B 6A 26 3A 24 0A 22 0A 0C 08 A6
+C0 D7 F1 03 10 AB FB F7 A7 0A 18 C4 87 C9 9C 04
+30 04 82 7D 09 08 FC 01 10 06 38 04 48 05 75 C9
+00
+```
+
+**Analysis:**
+- Device marker at offset 14: `0x28` (handheld)
+- Coordinate block starts at offset 28: `0A 0C 08...`
+- Latitude varint: `A6 C0 D7 F1 03` → 1039826854 → zigzag → 519913427 → 43.741724°
+- Longitude varint: `AB FB F7 A7 0A` → 2831000491 → zigzag → -1379565830 → -116.010107°
+
+### Dog Collar Position (78 bytes)
+
+```
+E7 3B 00 02 49 05 2B 95 1F 11 01 01 01 02 35 01
+01 02 35 01 01 23 6A 33 3A 31 0A 2F 0A 0C 08 80
+C0 D7 F1 03 10 FF EB F7 A7 0A 18 C3 87 C9 9C 04
+30 04 4D FE 99 BA 42 55 01 01 01 05 82 7D 0C 08
+02 10 0B 18 01 38 04 40 06 48 05 3F 8B 00
+```
+
+**Analysis:**
+- Device marker at offset 14: `0x35` (collar) ✅
+- Longer message (78 vs 65 bytes) — collar messages include extra data
+- Coordinate block starts at offset 28: `0A 0C 08...`
+- Latitude: 519913472 semicircles → 43.741722°
+- Longitude: -1379565825 semicircles → -116.010025°
+- Extra bytes after coordinates: `4D FE 99 BA 42` — this is a float32 (little-endian), possibly speed or heading
+
+### Movement Detection
+
+Comparing collar messages over time shows position changes:
+
+| Message # | Latitude | Longitude | Delta from Start |
+|-----------|----------|-----------|------------------|
+| 1 | 43.741722 | -116.010025 | — |
+| 3 | 43.741701 | -116.010046 | 2.5m |
+| 5 | 43.741701 | -116.010067 | 4.2m |
+| 10 | 43.741658 | -116.010325 | 24.5m |
+| 20 | 43.741508 | -116.010475 | 42.1m |
+
+The dog moved approximately 42 meters during the capture session (ball fetch confirmed! 🎾).
+
+---
+
+# Open Questions
+
+## Things We Haven't Figured Out Yet
+
+### 1. Multi-Dog Support
+- How are multiple collars distinguished?
+- Is there a dog ID field we haven't identified?
+- Current hypothesis: The repeated device marker section (`02 35 01 01 02 35 01 01`) may encode collar ID
+
+### 2. Extra Float Data
+- Collar messages include 4 bytes that decode as float32
+- Values observed: -0.001, -1.2e16, -2e9 (nonsensical as speed/heading)
+- May be encoded differently, or may be noise/padding
+
+### 3. Timestamp Format
+- Field at offset `18 XX XX XX XX` appears to be a timestamp
+- Values like `1133659075` observed
+- Not Unix timestamp (would be year 2005)
+- Possibly Garmin epoch (Dec 31, 1989) or relative timestamp
+
+### 4. Dog Status Indicators
+- Alpha can show "treed", "on point", "moving" status
+- Haven't identified where this is encoded
+- May require collar-to-handheld analysis (VHF side)
+
+### 5. Altitude/Elevation
+- GPS provides altitude but we haven't found it in the BLE data
+- May be in the unidentified fields after coordinates
+
+### 6. Compatibility
+- Tested only on Alpha 300i + TT25
+- Alpha 200i, 200, 100 likely use same protocol
+- Older collars (DC50, DC40, DC30) may differ
+
+## How to Help
+
+If you have access to Garmin Alpha hardware and want to contribute:
+
+1. **Capture more BLE data** — Different scenarios (multi-dog, varied terrain)
+2. **Test other models** — Confirm protocol across Alpha/collar variants
+3. **VHF analysis** — The collar-to-handheld link may reveal more data
+4. **Protocol comparison** — Compare with other documented Garmin protocols
+
+File issues or PRs with your findings!
+
+---
+
+## References
+
+- [Gadgetbridge Garmin Protocol Docs](https://gadgetbridge.org/internals/specifics/garmin-protocol/)
+- [Protocol Buffers Encoding](https://protobuf.dev/programming-guides/encoding/)
+- [TAK CoT Schema](https://github.com/deptofdefense/AndroidTacticalAssaultKit-CIV)
+- [nRF Connect for Mobile](https://www.nordicsemi.com/Products/Development-tools/nRF-Connect-for-mobile)
