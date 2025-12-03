@@ -1,0 +1,125 @@
+# Quick Reference: Garmin Alpha BT Capture
+
+## Pre-Capture Checklist
+- [ ] Developer Options enabled on Android
+- [ ] USB Debugging enabled
+- [ ] BT HCI snoop log enabled
+- [ ] Bluetooth toggled OFF then ON (to start fresh log)
+- [ ] Alpha app installed
+- [ ] Alpha 300i powered on with TT25 showing
+- [ ] Notepad ready for coordinates/timestamps
+
+## ADB Quick Commands
+
+```bash
+# Verify phone connected
+adb devices
+
+# Toggle BT to start fresh capture
+adb shell cmd bluetooth_manager disable
+sleep 2
+adb shell cmd bluetooth_manager enable
+
+# Pull log after capture (try in order)
+adb pull /sdcard/btsnoop_hci.log .
+adb pull /sdcard/Android/data/btsnoop_hci.log .
+adb bugreport bugreport.zip  # Last resort
+
+# Get Alpha 300i MAC address from phone
+adb shell dumpsys bluetooth_manager | grep -i alpha
+```
+
+## Capture Sequence (5 min)
+
+| Time | Action | Notes |
+|------|--------|-------|
+| 0:00 | Open Alpha app | Note BT MAC if visible |
+| 0:30 | Connect to 300i | Wait for connection |
+| 1:00 | Dog appears | Write down coords! |
+| 1:30 | Move collar | Known location |
+| 3:00 | Note new coords | Write them down |
+| 5:00 | Stop capture | Pull the log |
+
+## Data to Record
+
+**Write these down during capture:**
+
+- Alpha 300i BT MAC: `__:__:__:__:__:__`
+- Alpha app version: ___________
+- Dog name/ID in app: ___________
+- Coords when first visible: _______, _______
+- Coords after moving: _______, _______
+- Time when moved collar: __:__
+
+## Wireshark Filters
+
+```
+# All GATT/ATT
+btatt
+
+# Filter to Alpha MAC
+btatt && bluetooth.addr == AA:BB:CC:DD:EE:FF
+
+# Notifications only (position updates?)
+btatt.opcode == 0x1b
+
+# Substantial data packets
+btatt && frame.len > 20
+```
+
+## Analysis Script Usage
+
+```bash
+# Basic analysis
+python3 analyze_alpha_bt.py btsnoop_hci.log
+
+# With expected coordinates (Boise area example)
+python3 analyze_alpha_bt.py btsnoop_hci.log \
+  --lat 43.615 --lon -116.202
+
+# Filter to specific device
+python3 analyze_alpha_bt.py btsnoop_hci.log \
+  --mac AA:BB:CC:DD:EE:FF
+
+# Export suspicious handle for deep analysis
+python3 analyze_alpha_bt.py btsnoop_hci.log \
+  --export-handle 0x0015 --output handle_0x0015.csv
+```
+
+## What Success Looks Like
+
+✓ Packets with ~2.5s intervals (Alpha update rate)
+✓ Handle with notification opcode (0x1b)
+✓ Data length 8+ bytes (room for lat+lon)
+✓ Coordinate decode matches your observed position
+
+## Red Flags
+
+✗ No BTATT packets → May be classic BT, not BLE
+✗ All data looks random → Possibly encrypted
+✗ No periodic patterns → Wrong handle or missing data
+✗ Coords decode to wrong location → Wrong format
+
+## Coordinate Formats to Try
+
+| Format | Example (43.615°) |
+|--------|-------------------|
+| Int × 1e7 | 436150000 (0x19FC4B90) |
+| Semicircles | 518916505 (0x1EF4B699) |
+| Float32 | 43.615 as IEEE float |
+
+## Next Steps After Capture
+
+1. Pull the log file
+2. Open in Wireshark, filter to btatt
+3. Run analyze_alpha_bt.py
+4. Look for handles with 2.5s update pattern
+5. Export suspicious handles to CSV
+6. Search for coordinate patterns
+7. Document findings
+
+## Contacts/Resources
+
+- Wireshark BT docs: wiki.wireshark.org/Bluetooth
+- Garmin FIT SDK: developer.garmin.com/fit/protocol
+- installTAK repo: [your repo URL]
