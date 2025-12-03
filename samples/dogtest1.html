@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Garmin Alpha Track Viewer</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <style>
+        body { margin: 0; padding: 0; font-family: sans-serif; }
+        #map { height: 80vh; width: 100%; }
+        #info { padding: 15px; background: #f5f5f5; }
+        .legend { background: white; padding: 10px; border-radius: 5px; }
+        h2 { margin: 0 0 10px 0; }
+    </style>
+</head>
+<body>
+    <div id="info">
+        <h2>🐕 Garmin Alpha 300i + TT25 Track Analysis</h2>
+        <p><strong>Protocol Decoded:</strong> Multi-Link BLE with Protobuf coordinates (Garmin semicircles)</p>
+        <p>📱 Blue = Handheld (6 points) | 🐕 Red = Dog Collar (49 points)</p>
+    </div>
+    <div id="map"></div>
+    <script>
+        // Extracted track data from BLE capture
+        const handheldTrack = [
+            [43.741724, -116.010107],
+            [43.741749, -116.010213],
+            [43.741675, -116.010316],
+            [43.741689, -116.010373],
+            [43.741690, -116.010371],
+            [43.741692, -116.010356]
+        ];
+        
+        const collarTrack = [
+            [43.741722, -116.010025],
+            [43.741722, -116.010025],
+            [43.741701, -116.010046],
+            [43.741701, -116.010089],
+            [43.741701, -116.010067],
+            [43.741679, -116.010303],
+            [43.741658, -116.010325],
+            [43.741658, -116.010325],
+            [43.741658, -116.010325],
+            [43.741658, -116.010346],
+            [43.741658, -116.010346],
+            [43.741658, -116.010368],
+            [43.741550, -116.010475],
+            [43.741508, -116.010475],
+            [43.741690, -116.010371],
+            [43.741529, -116.010475],
+            [43.741572, -116.010454],
+            [43.741615, -116.010411],
+            [43.741636, -116.010389],
+            [43.741636, -116.010432],
+            [43.741572, -116.010497],
+            [43.741636, -116.010432],
+            [43.741636, -116.010411],
+            [43.741636, -116.010411],
+            [43.741615, -116.010475],
+            [43.741636, -116.010411],
+            [43.741679, -116.010518],
+            [43.741636, -116.010411],
+            [43.741615, -116.010432],
+            [43.741615, -116.010432],
+            [43.741636, -116.010389],
+            [43.741550, -116.010432],
+            [43.741529, -116.010432],
+            [43.741529, -116.010432],
+            [43.741572, -116.010389],
+            [43.741593, -116.010389],
+            [43.741593, -116.010389],
+            [43.741593, -116.010389],
+            [43.741572, -116.010432],
+            [43.741550, -116.010540],
+            [43.741572, -116.010518],
+            [43.741593, -116.010475],
+            [43.741615, -116.010432],
+            [43.741615, -116.010432],
+            [43.741615, -116.010411],
+            [43.741615, -116.010432],
+            [43.741636, -116.010411],
+            [43.741636, -116.010389]
+        ];
+
+        // Calculate center
+        const allLats = [...handheldTrack, ...collarTrack].map(p => p[0]);
+        const allLons = [...handheldTrack, ...collarTrack].map(p => p[1]);
+        const centerLat = (Math.min(...allLats) + Math.max(...allLats)) / 2;
+        const centerLon = (Math.min(...allLons) + Math.max(...allLons)) / 2;
+
+        // Initialize map
+        const map = L.map('map').setView([centerLat, centerLon], 19);
+        
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            maxZoom: 22,
+            attribution: '© OpenStreetMap'
+        }).addTo(map);
+
+        // Add handheld track (blue)
+        L.polyline(handheldTrack, {color: 'blue', weight: 4, opacity: 0.8}).addTo(map)
+            .bindPopup('📱 Handheld Track');
+        
+        // Add collar track (red)
+        L.polyline(collarTrack, {color: 'red', weight: 3, opacity: 0.8}).addTo(map)
+            .bindPopup('🐕 Dog Collar Track');
+
+        // Add markers for handheld positions
+        handheldTrack.forEach((pos, i) => {
+            L.circleMarker(pos, {radius: 6, color: 'blue', fillColor: 'lightblue', fillOpacity: 0.8})
+                .addTo(map)
+                .bindPopup(`📱 Handheld #${i+1}<br>${pos[0].toFixed(6)}, ${pos[1].toFixed(6)}`);
+        });
+
+        // Add markers for collar positions
+        collarTrack.forEach((pos, i) => {
+            L.circleMarker(pos, {radius: 4, color: 'red', fillColor: 'pink', fillOpacity: 0.6})
+                .addTo(map)
+                .bindPopup(`🐕 Collar #${i+1}<br>${pos[0].toFixed(6)}, ${pos[1].toFixed(6)}`);
+        });
+
+        // Add start markers
+        L.marker(handheldTrack[0], {title: 'Handheld Start'}).addTo(map)
+            .bindPopup('📱 Handheld Start');
+        L.marker(collarTrack[0], {title: 'Dog Start'}).addTo(map)
+            .bindPopup('🐕 Dog Start Position');
+
+        // Fit bounds to show all tracks
+        const allPoints = [...handheldTrack, ...collarTrack];
+        map.fitBounds(allPoints);
+    </script>
+</body>
+</html>
