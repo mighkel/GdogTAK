@@ -1,0 +1,364 @@
+# Garmin Alpha Bluetooth Snoop Analysis Guide
+
+## Objective
+
+Capture and analyze Bluetooth traffic between the Garmin Alpha Android app and the Alpha 300i handheld to understand how dog collar (TT25) position data is transmitted. The goal is to determine if we can extract this data to bridge to TAK.
+
+---
+
+## Prerequisites
+
+### Hardware
+- Android phone (Android 4.4+, ideally 8.0+ for better logging)
+- Garmin Alpha 300i handheld
+- Garmin TT25 collar (or other compatible collar)
+- Computer with Wireshark installed
+- USB cable for Android device
+
+### Software on Computer
+- **Wireshark**: https://www.wireshark.org/download.html
+- **ADB (Android Debug Bridge)**: Part of Android SDK Platform Tools
+  - Download: https://developer.android.com/studio/releases/platform-tools
+  - Or on Linux: `sudo apt install adb`
+
+### Software on Android
+- **Garmin Alpha app**: Install from Google Play Store
+- **Developer Options enabled** (see setup below)
+
+---
+
+## Phase 1: Setup
+
+### 1.1 Enable Developer Options on Android
+
+1. Go to **Settings → About Phone**
+2. Tap **Build Number** 7 times
+3. You'll see "You are now a developer!"
+4. Go back to **Settings → System → Developer Options**
+
+### 1.2 Enable USB Debugging
+
+1. In **Developer Options**, enable **USB Debugging**
+2. Connect phone to computer via USB
+3. Accept the debugging authorization prompt on phone
+4. Verify connection:
+   ```bash
+   adb devices
+   ```
+   Should show your device listed.
+
+### 1.3 Enable Bluetooth HCI Snoop Log
+
+1. In **Developer Options**, find **Enable Bluetooth HCI snoop log**
+2. Toggle it **ON**
+3. **Important**: Toggle Bluetooth OFF then ON again to start fresh logging
+4. Note: Log location varies by device/Android version:
+   - `/sdcard/btsnoop_hci.log`
+   - `/sdcard/Android/data/btsnoop_hci.log`
+   - `/data/misc/bluetooth/logs/btsnoop_hci.log` (requires root)
+
+### 1.4 Verify Logging is Active
+
+After toggling Bluetooth:
+```bash
+# Try common locations
+adb shell ls -la /sdcard/btsnoop_hci.log
+adb shell ls -la /sdcard/Android/data/btsnoop_hci.log
+
+# If those fail, try via bugreport (always works)
+adb bugreport bugreport.zip
+# The btsnoop log will be inside the zip under FS/data/misc/bluetooth/logs/
+```
+
+---
+
+## Phase 2: Capture Session
+
+### 2.1 Prepare the Equipment
+
+1. **Alpha 300i**: Power on, ensure TT25 collar is paired and showing on map
+2. **TT25 Collar**: Power on, confirm handheld shows dog position
+3. **Android Phone**: 
+   - Close Garmin Alpha app completely (swipe away from recent apps)
+   - Clear any existing Bluetooth pairings with the Alpha 300i (optional, for clean capture)
+
+### 2.2 Capture Procedure
+
+**Start fresh:**
+```bash
+# Clear any existing log (if accessible)
+adb shell rm /sdcard/btsnoop_hci.log 2>/dev/null
+
+# Toggle Bluetooth to start fresh capture
+adb shell cmd bluetooth_manager disable
+sleep 2
+adb shell cmd bluetooth_manager enable
+```
+
+**Capture sequence:**
+
+1. **T+0:00** - Open Garmin Alpha app on phone
+2. **T+0:30** - Connect to Alpha 300i via Bluetooth (app should prompt or auto-connect)
+3. **T+1:00** - Wait for dog position to appear in app
+4. **T+1:30** - Move the TT25 collar to a known location (or have someone walk with it)
+5. **T+3:00** - Note the coordinates shown in the Alpha app for reference
+6. **T+5:00** - End capture session
+
+**Capture notes to record:**
+- Timestamp when dog position first appeared
+- Any coordinates you observed (write them down!)
+- MAC address of Alpha 300i (visible in Bluetooth settings)
+- Any error messages or connection issues
+
+### 2.3 Pull the Capture File
+
+```bash
+# Create output directory
+mkdir -p ~/garmin-alpha-analysis
+cd ~/garmin-alpha-analysis
+
+# Try direct pull first
+adb pull /sdcard/btsnoop_hci.log ./btsnoop_hci.log
+
+# If that fails, try alternate location
+adb pull /sdcard/Android/data/btsnoop_hci.log ./btsnoop_hci.log
+
+# If both fail, use bugreport method
+adb bugreport bugreport.zip
+unzip bugreport.zip
+# Find the log: find . -name "btsnoop_hci.log"
+```
+
+---
+
+## Phase 3: Wireshark Analysis
+
+### 3.1 Open the Capture
+
+1. Launch Wireshark
+2. **File → Open** → select `btsnoop_hci.log`
+3. Wireshark will automatically recognize the Bluetooth HCI format
+
+### 3.2 Initial Filtering
+
+First, identify the Alpha 300i's Bluetooth address. Look for device names or check your phone's Bluetooth settings.
+
+**Basic Bluetooth filter:**
+```
+bluetooth
+```
+
+**Filter to specific device (replace XX:XX:XX:XX:XX:XX with Alpha 300i MAC):**
+```
+bluetooth.addr == XX:XX:XX:XX:XX:XX
+```
+
+**Filter for GATT/ATT traffic only (where the data lives):**
+```
+btatt
+```
+
+**Combined filter:**
+```
+btatt && bluetooth.addr == XX:XX:XX:XX:XX:XX
+```
+
+### 3.3 Understanding BLE GATT Structure
+
+Bluetooth Low Energy uses GATT (Generic Attribute Profile):
+- **Services**: Groups of related data (identified by UUID)
+- **Characteristics**: Individual data points within a service (also have UUIDs)
+- **Handles**: Numeric references to characteristics (e.g., 0x000b, 0x0011)
+
+**Key packet types to look for:**
+- `ATT Read Request` / `ATT Read Response` - Reading data
+- `ATT Write Request` / `ATT Write Command` - Writing data
+- `ATT Handle Value Notification` - Push updates (likely where position data comes)
+
+### 3.4 Hunting for Position Data
+
+GPS coordinates are typically encoded as:
+- **Integer format**: lat/lon × 10^7 (e.g., 43.6150000°N = 436150000)
+- **Float format**: IEEE 754 32-bit floats
+- **Garmin semicircles**: lat/lon × (2^31 / 180)
+
+**Example: Looking for Boise area coordinates**
+
+If you captured near Boise (approx 43.615°N, 116.202°W):
+
+Integer × 10^7:
+- Latitude: 436150000 = 0x19FC4B90
+- Longitude: -1162020000 = 0xBA9D2CE0 (or as unsigned: 0x3132D320)
+
+**In Wireshark, use hex search:**
+1. **Edit → Find Packet**
+2. Select "Hex value"
+3. Search for partial sequences: `90 4B FC 19` (little-endian lat)
+
+### 3.5 Useful Wireshark Display Columns
+
+Add these columns for easier analysis:
+1. Right-click column header → **Column Preferences**
+2. Add:
+   - `btatt.handle` - ATT Handle
+   - `btatt.value` - ATT Value (the actual data)
+   - `btatt.uuid128` - Full UUID if present
+
+### 3.6 Export for Further Analysis
+
+**Export specific packets:**
+1. Apply your filter
+2. **File → Export Specified Packets**
+3. Choose format (pcapng or JSON for scripting)
+
+**Export as JSON for Python analysis:**
+```bash
+tshark -r btsnoop_hci.log -T json -Y "btatt" > btatt_packets.json
+```
+
+---
+
+## Phase 4: Pattern Analysis
+
+### 4.1 Look for Periodic Updates
+
+Dog position updates should appear at regular intervals (the Alpha system updates every 2.5 seconds at fastest).
+
+**In Wireshark:**
+1. Sort by Time column
+2. Look for repeated Handle Value Notifications
+3. Note the handle numbers that repeat at ~2.5s intervals
+
+### 4.2 Correlate with Known Events
+
+Match packet timestamps to your capture notes:
+- When did the app first show dog position? Look for packets just before that time.
+- When did you move the collar? Look for data changes at that timestamp.
+
+### 4.3 Identify Data Structure
+
+Once you find candidate packets, analyze the byte structure:
+
+```
+Example packet (hypothetical):
+0x12 0x34 | 0x90 0x4B 0xFC 0x19 | 0x20 0xD3 0x32 0x31 | 0x05 0x00
+
+Possibly:
+[msg type] | [latitude 4 bytes] | [longitude 4 bytes] | [status/flags]
+```
+
+**Things to look for in the data:**
+- Fixed header bytes (same in every packet)
+- 4-byte or 8-byte sequences that could be coordinates
+- Incrementing values (could be timestamp or sequence number)
+- Dog ID or collar identifier
+
+---
+
+## Phase 5: Document Your Findings
+
+### Create a findings document with:
+
+1. **Device Information**
+   - Alpha 300i firmware version
+   - Alpha app version
+   - Android version
+   - Bluetooth MAC addresses
+
+2. **GATT Service/Characteristic Map**
+   - List all UUIDs discovered
+   - Note which handles carry what data
+   
+3. **Data Format Hypothesis**
+   - Byte layout diagram
+   - Encoding for coordinates
+   - Update frequency
+
+4. **Sample Packets**
+   - Copy several examples with timestamps
+   - Annotate suspected field boundaries
+
+---
+
+## Quick Reference: Common Wireshark Filters
+
+```
+# All Bluetooth traffic
+bluetooth
+
+# Only ATT/GATT
+btatt
+
+# Specific device
+bluetooth.addr == AA:BB:CC:DD:EE:FF
+
+# Write operations only
+btatt.opcode == 0x12 || btatt.opcode == 0x52
+
+# Notifications only (likely position updates)
+btatt.opcode == 0x1b
+
+# Specific handle (once you identify the position handle)
+btatt.handle == 0x0015
+
+# Contains specific hex bytes
+btatt.value contains 90:4b:fc
+
+# Packets with substantial data (filter out empty/small)
+frame.len > 20
+```
+
+---
+
+## Troubleshooting
+
+### No btsnoop_hci.log file found
+- Ensure Bluetooth HCI snoop log is enabled
+- Toggle Bluetooth OFF/ON after enabling
+- Try the bugreport method
+- Some devices require root for direct log access
+
+### File is empty or very small
+- Make sure Bluetooth was toggled after enabling snoop log
+- Verify the Alpha app actually connected (check app shows connected status)
+- Some phones only log certain packet types
+
+### Can't see any useful data
+- The app may use Bluetooth Classic (BR/EDR) instead of BLE
+- Data may be encrypted at the application layer
+- Try looking at `hci_h4` instead of `btatt` for classic Bluetooth
+
+### Wireshark shows malformed packets
+- File may have been truncated during pull
+- Try pulling again with phone screen on and unlocked
+- Use bugreport method for more reliable extraction
+
+---
+
+## Next Steps After Analysis
+
+If you successfully identify the position data format:
+
+1. **Verify**: Capture another session and confirm the same patterns
+2. **Decode**: Write a Python script to parse the byte format
+3. **Bridge**: Build the Android service or Frida hook to capture live data
+4. **CoT**: Format and push to TAK Server
+
+If data appears encrypted or obfuscated:
+1. Try Frida hooking (intercept after app decryption)
+2. Look for patterns in the encrypted data
+3. Check if the app stores decrypted data locally
+
+---
+
+## Resources
+
+- Wireshark Bluetooth Wiki: https://wiki.wireshark.org/Bluetooth
+- Android BT HCI Logging: https://source.android.com/docs/core/connect/bluetooth/verifying_debugging
+- GATT Specification: https://www.bluetooth.com/specifications/specs/generic-attribute-profile-1-1/
+- Garmin FIT Protocol (may share encoding): https://developer.garmin.com/fit/protocol/
+
+---
+
+*Document version: 1.0*
+*Created for Clear Creek VFD K9 TAK Integration Project*
