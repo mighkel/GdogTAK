@@ -4,18 +4,30 @@ package com.gdogtak.ble
  * Garmin Multi-Link BLE Protocol Parser
  *
  * Decodes dog collar and handheld position data from Garmin Alpha
- * BLE notifications on characteristic 6a4e2813-667b-11e3-949a-0800200c9a66
+ * BLE notifications on the Garmin Multi-Link service.
  *
  * Protocol findings:
  * - Device marker 0x35 = dog collar, 0x28 = handheld
  * - Coordinates encoded as Garmin semicircles in protobuf varints
  * - Pattern: 0A 0C 08 [lat varint] 10 [lon varint] 18 [timestamp]
+ * - Data may arrive on different characteristics (2810, 2811, 2812, 2813, 2814)
  */
 object GarminProtocol {
 
-    // Garmin Multi-Link Service and Characteristic UUIDs
+    // Garmin Multi-Link Service UUID
     const val SERVICE_UUID = "6a4e2800-667b-11e3-949a-0800200c9a66"
-    const val NOTIFY_CHAR_UUID = "6a4e2813-667b-11e3-949a-0800200c9a66"
+
+    // Notification characteristic UUIDs - data can arrive on any of these
+    val NOTIFY_CHAR_UUIDS = listOf(
+        "6a4e2810-667b-11e3-949a-0800200c9a66",
+        "6a4e2811-667b-11e3-949a-0800200c9a66",
+        "6a4e2812-667b-11e3-949a-0800200c9a66",
+        "6a4e2813-667b-11e3-949a-0800200c9a66",
+        "6a4e2814-667b-11e3-949a-0800200c9a66"
+    )
+
+    // Legacy single UUID for backwards compatibility
+    const val NOTIFY_CHAR_UUID = "6a4e2811-667b-11e3-949a-0800200c9a66"
 
     // Device type markers
     private const val DEVICE_COLLAR: Byte = 0x35

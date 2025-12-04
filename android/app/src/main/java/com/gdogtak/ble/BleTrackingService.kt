@@ -24,7 +24,7 @@ import java.util.*
 /**
  * Background service that:
  * 1. Scans for and connects to Garmin Alpha handheld via BLE
- * 2. Subscribes to position notifications
+ * 2. Subscribes to position notifications on multiple characteristics
  * 3. Parses dog collar positions
  * 4. Broadcasts to ATAK via UDP multicast
  */
@@ -61,6 +61,10 @@ class BleTrackingService : Service() {
     private var bluetoothGatt: BluetoothGatt? = null
     private var bleScanner: BluetoothLeScanner? = null
     private var isScanning = false
+
+    // Track which characteristics we've enabled notifications on
+    private val pendingNotifyChars = mutableListOf<BluetoothGattCharacteristic>()
+    private var notifyEnableIndex = 0
 
     // Coroutines
     private val serviceScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
@@ -277,7 +281,7 @@ class BleTrackingService : Service() {
 
             Log.i(TAG, "Services discovered")
 
-            // Find the Garmin service and notification characteristic
+            // Find the Garmin service
             val service = gatt.getService(UUID.fromString(GarminProtocol.SERVICE_UUID))
             if (service == null) {
                 Log.e(TAG, "Garmin service not found")
@@ -285,17 +289,29 @@ class BleTrackingService : Service() {
                 return
             }
 
-            val characteristic = service.getCharacteristic(
-                UUID.fromString(GarminProtocol.NOTIFY_CHAR_UUID)
-            )
-            if (characteristic == null) {
-                Log.e(TAG, "Notification characteristic not found")
-                updateStatus(Status.ERROR, "Position characteristic not found")
+            // Collect all notify characteristics
+            pendingNotifyChars.clear()
+            notifyEnableIndex = 0
+
+            for (charUuid in GarminProtocol.NOTIFY_CHAR_UUIDS) {
+                val characteristic = service.getCharacteristic(UUID.fromString(charUuid))
+                if (characteristic != null) {
+                    pendingNotifyChars.add(characteristic)
+                    Log.i(TAG, "Found characteristic: $charUuid")
+                } else {
+                    Log.w(TAG, "Characteristic not found: $charUuid")
+                }
+            }
+
+            if (pendingNotifyChars.isEmpty()) {
+                Log.e(TAG, "No notification characteristics found")
+                updateStatus(Status.ERROR, "No position characteristics found")
                 return
             }
 
-            // Enable notifications
-            enableNotifications(gatt, characteristic)
+            Log.i(TAG, "Enabling notifications on ${pendingNotifyChars.size} characteristics...")
+            // Start enabling notifications on the first characteristic
+            enableNextNotification(gatt)
         }
 
         override fun onCharacteristicChanged(
@@ -303,9 +319,10 @@ class BleTrackingService : Service() {
             characteristic: BluetoothGattCharacteristic,
             value: ByteArray
         ) {
-            Log.d(TAG, "onCharacteristicChanged (new API): ${value.size} bytes")
+            val charUuid = characteristic.uuid.toString().takeLast(4)
+            Log.d(TAG, "onCharacteristicChanged (char $charUuid): ${value.size} bytes")
             // Parse the notification
-            handleNotification(value)
+            handleNotification(value, charUuid)
         }
 
         // Deprecated but needed for older Android versions
@@ -314,8 +331,9 @@ class BleTrackingService : Service() {
             gatt: BluetoothGatt,
             characteristic: BluetoothGattCharacteristic
         ) {
-            Log.d(TAG, "onCharacteristicChanged (old API): ${characteristic.value?.size} bytes")
-            characteristic.value?.let { handleNotification(it) }
+            val charUuid = characteristic.uuid.toString().takeLast(4)
+            Log.d(TAG, "onCharacteristicChanged (char $charUuid, old API): ${characteristic.value?.size} bytes")
+            characteristic.value?.let { handleNotification(it, charUuid) }
         }
 
         override fun onDescriptorWrite(
@@ -323,14 +341,41 @@ class BleTrackingService : Service() {
             descriptor: BluetoothGattDescriptor,
             status: Int
         ) {
+            val charUuid = descriptor.characteristic.uuid.toString().takeLast(4)
             if (status == BluetoothGatt.GATT_SUCCESS) {
-                Log.i(TAG, "CCCD write SUCCESS - notifications should flow now")
-                updateStatus(Status.TRACKING, "Tracking active")
+                Log.i(TAG, "CCCD write SUCCESS for char $charUuid")
+                // Enable notifications on the next characteristic
+                notifyEnableIndex++
+                if (notifyEnableIndex < pendingNotifyChars.size) {
+                    enableNextNotification(gatt)
+                } else {
+                    Log.i(TAG, "All ${pendingNotifyChars.size} characteristics enabled!")
+                    updateStatus(Status.TRACKING, "Tracking active (${pendingNotifyChars.size} channels)")
+                }
             } else {
-                Log.e(TAG, "CCCD write FAILED with status: $status")
-                updateStatus(Status.ERROR, "Failed to enable notifications")
+                Log.e(TAG, "CCCD write FAILED for char $charUuid with status: $status")
+                // Try the next one anyway
+                notifyEnableIndex++
+                if (notifyEnableIndex < pendingNotifyChars.size) {
+                    enableNextNotification(gatt)
+                } else {
+                    updateStatus(Status.TRACKING, "Tracking (some channels failed)")
+                }
             }
         }
+    }
+
+    /**
+     * Enable notifications on the next characteristic in the queue
+     */
+    private fun enableNextNotification(gatt: BluetoothGatt) {
+        if (notifyEnableIndex >= pendingNotifyChars.size) return
+
+        val characteristic = pendingNotifyChars[notifyEnableIndex]
+        val charUuid = characteristic.uuid.toString().takeLast(4)
+        Log.i(TAG, "Enabling notifications on char $charUuid (${notifyEnableIndex + 1}/${pendingNotifyChars.size})")
+
+        enableNotifications(gatt, characteristic)
     }
 
     /**
@@ -354,11 +399,14 @@ class BleTrackingService : Service() {
                     @Suppress("DEPRECATION")
                     gatt.writeDescriptor(descriptor)
                 }
-                Log.i(TAG, "CCCD write initiated, waiting for callback...")
-                // Status update moved to onDescriptorWrite callback
+                Log.i(TAG, "CCCD write initiated for ${characteristic.uuid.toString().takeLast(4)}")
             } else {
-                Log.e(TAG, "CCCD descriptor not found")
-                updateStatus(Status.ERROR, "CCCD not found")
+                Log.e(TAG, "CCCD descriptor not found for ${characteristic.uuid.toString().takeLast(4)}")
+                // Skip to next
+                notifyEnableIndex++
+                if (notifyEnableIndex < pendingNotifyChars.size) {
+                    enableNextNotification(gatt)
+                }
             }
         } catch (e: SecurityException) {
             Log.e(TAG, "Security exception enabling notifications", e)
@@ -368,8 +416,12 @@ class BleTrackingService : Service() {
     /**
      * Handle incoming BLE notification with position data
      */
-    private fun handleNotification(data: ByteArray) {
-        Log.d(TAG, "Received notification: ${data.size} bytes")
+    private fun handleNotification(data: ByteArray, charUuid: String) {
+        Log.d(TAG, "Received notification on $charUuid: ${data.size} bytes")
+
+        // Log first 20 bytes for debugging
+        val hexPreview = data.take(20).joinToString("-") { "%02X".format(it) }
+        Log.d(TAG, "Data preview: $hexPreview...")
 
         val position = GarminProtocol.parseNotification(data)
 
@@ -377,7 +429,7 @@ class BleTrackingService : Service() {
             positionCount++
             lastPosition = position
 
-            Log.d(TAG, "Dog position #$positionCount: ${position.latitude}, ${position.longitude}")
+            Log.i(TAG, "Dog position #$positionCount from char $charUuid: ${position.latitude}, ${position.longitude}")
 
             // Generate and send CoT
             val cot = CotGenerator.generateCot(position, dogConfig)
