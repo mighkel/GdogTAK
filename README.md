@@ -1,115 +1,144 @@
-# Garmin Alpha → TAK Integration
+# GdogTAK
 
-**Track your SAR K9 in ATAK/WinTAK using Garmin Alpha 300i + TT25 collar**
-
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Status: Research](https://img.shields.io/badge/Status-Research%2FPrototype-orange)]()
-
-## What This Does
+**Track your SAR K9 in ATAK/WinTAK using Garmin Alpha GPS dog tracking hardware**
 
 This project enables real-time dog tracking in TAK (Team Awareness Kit) systems using Garmin's Alpha dog tracking hardware. Your SAR K9's position shows up on the same map as your team members — no cell service required.
 
 ```
-┌─────────────┐     VHF      ┌─────────────┐     BLE      ┌─────────────┐     CoT      ┌─────────────┐
-│  TT25 Dog   │─────────────▶│  Alpha 300i │─────────────▶│  Android    │─────────────▶│    ATAK     │
-│   Collar    │   (9 miles)  │  Handheld   │  (Bluetooth) │  Bridge App │  (local/net) │  TAK Server │
-└─────────────┘              └─────────────┘              └─────────────┘              └─────────────┘
+┌─────────────┐  VHF   ┌─────────────┐  BLE   ┌─────────────┐  CoT   ┌─────────────┐
+│  TT25 Dog   │───────▶│ Alpha 300i  │───────▶│   GdogTAK   │───────▶│    ATAK     │
+│   Collar    │ 9 mi   │  Handheld   │        │ Android App │  UDP   │  TAK Server │
+└─────────────┘        └─────────────┘        └─────────────┘        └─────────────┘
 ```
 
-## Project Status
+## 🎉 Status: Working Prototype
 
-🔬 **Research/Prototype Phase**
+**December 2024**: Android app successfully displays dog collar positions in ATAK!
 
-We've successfully reverse-engineered the Garmin Alpha BLE protocol and can decode dog collar positions. A working Python prototype exists. Android app development is next.
-
-### What Works
-- ✅ BLE protocol decoded (Garmin Multi-Link)
-- ✅ Coordinate encoding understood (semicircles in protobuf)
-- ✅ Dog vs handheld positions distinguished
-- ✅ Python parser/bridge prototype
-- ✅ CoT XML generation for TAK
-
-### In Progress
-- 🔧 Android app for production deployment
-- 🔧 Multi-dog support
-- 🔧 Testing with various Alpha models (300i, 200i, 100)
-
-### Planned
+- ✅ BLE protocol reverse-engineered (Garmin Multi-Link service)
+- ✅ Android app connects to Alpha 300i via Bluetooth LE
+- ✅ Dog positions decoded and broadcast as CoT to TAK network
+- ✅ K9 icon appears on ATAK map with real-time position updates
+- ⚠️ Currently requires Garmin Explore app running (triggers data stream)
+- 🔧 Settings UI for dog names/callsigns (in progress)
+- 🔧 Multi-dog support (in progress)
+- 📋 Standalone operation (init command discovery needed)
 - 📋 ATAK plugin for integrated UI
-- 📋 Dog status indicators (treed, on point, moving)
-- 📋 Track history/breadcrumbs
 
 ## Hardware Requirements
 
-- **Garmin Alpha handheld**: Alpha 300i (tested), likely works with 200i, 200, 100
-- **Garmin dog collar**: TT25 (tested), likely works with T20, TT15, T5
-- **Android phone**: Any phone with Bluetooth LE (no root required)
-- **TAK setup**: ATAK on Android, or WinTAK + TAK Server
+| Component | Tested | Likely Compatible |
+|-----------|--------|-------------------|
+| **Handheld** | Alpha 300i | Alpha 200i, Alpha 200, Alpha 100 |
+| **Collar** | TT25 | TT20, TT15, T5 |
+| **Phone** | Samsung S24 Ultra | Any Android with BLE support |
+| **TAK** | ATAK 5.2+, WinTAK | Any TAK client on same network |
 
-## Quick Start (Prototype)
+## Quick Start
+
+### 1. Build the Android App
 
 ```bash
-# Clone the repo
-git clone https://github.com/YOUR_USERNAME/garmin-alpha-tak.git
-cd garmin-alpha-tak
+git clone https://github.com/mighkel/GdogTAK.git
+cd GdogTAK/android
 
-# Install dependencies
-pip install bleak
+# Open in Android Studio and build, or:
+./gradlew assembleDebug
+adb install app/build/outputs/apk/debug/app-debug.apk
+```
 
-# Run demo mode (tests the parser)
-python garmin_alpha_tak_bridge.py --demo
+### 2. Prepare Your Devices
 
-# Run with actual hardware (replace with your Alpha's MAC address)
-python garmin_alpha_tak_bridge.py --device FA:1A:C1:B3:DC:2F
+1. **Power on** your Alpha handheld and TT25 collar
+2. **Verify** the collar shows on the Alpha's map
+3. **Open Garmin Explore** app on your phone (required for now)
+4. **Start ATAK** and ensure SA multicast is enabled
+
+### 3. Run GdogTAK
+
+1. Launch GdogTAK app
+2. Grant Bluetooth and location permissions
+3. Tap "Start Tracking"
+4. Wait for "Tracking active (5 channels)" status
+5. Your dog appears in ATAK as "K9-DOG1"!
+
+## Architecture
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                        GdogTAK Android App                      │
+├────────────────────────────────────────────────────────────────┤
+│  BleTrackingService          │  GarminProtocol                 │
+│  - Scans for "Alpha" devices │  - Parses Garmin BLE packets    │
+│  - Manages BLE connection    │  - Decodes protobuf coordinates │
+│  - Subscribes to 5 notify    │  - Extracts dog vs handheld     │
+│    characteristics           │    positions                    │
+├────────────────────────────────────────────────────────────────┤
+│  CotGenerator                │  AtakBroadcaster                │
+│  - Creates CoT XML events    │  - UDP multicast to 239.2.3.1   │
+│  - SAR K9 team/role metadata │  - Port 6969 (SA channel)       │
+└────────────────────────────────────────────────────────────────┘
 ```
 
 ## Documentation
 
-- **[PROTOCOL.md](PROTOCOL.md)** — Detailed protocol documentation
-  - "I just want to understand it" summary
-  - "I want to hack on this" technical deep-dive
-  - Raw data samples and analysis
+- **[PROTOCOL.md](PROTOCOL.md)** — Garmin BLE protocol deep-dive
+- **[docs/BLE-CHARACTERISTICS.md](docs/BLE-CHARACTERISTICS.md)** — Characteristic UUIDs and data flow
+- **[docs/COORDINATE-ENCODING.md](docs/COORDINATE-ENCODING.md)** — Semicircle to decimal conversion
+- **[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)** — Common issues and solutions
 
-- **[alpha-bt-capture-quickref.md](docs/alpha-bt-capture-quickref.md)** — Quick reference for BLE capture
+## Current Limitations
+
+### Requires Garmin Explore Running
+
+The Alpha 300i only streams position data over BLE when Garmin Explore is connected and has triggered an initialization command. We're working to identify this command for standalone operation.
+
+**Workaround**: Keep Garmin Explore running in background while using GdogTAK.
+
+### Single Dog Callsign
+
+Currently hardcoded to "K9-DOG1". Settings UI for custom callsigns is planned.
+
+### BLE Connection Exclusivity
+
+Only one app can connect to the Alpha at a time. If Explore is connected, GdogTAK can't connect (and vice versa). The current workaround piggybacks on Explore's connection.
 
 ## Use Cases
 
-### SAR K9 Operations
-Track your search dog's position in real-time during wilderness searches. Works in areas with no cell coverage — the Alpha's VHF link gives you 9 miles of range to the collar.
+### Search and Rescue
+Track your SAR K9's position during wilderness searches. Works in areas with no cell coverage — the Alpha's VHF link gives you 9+ miles of range to the collar.
 
-### Hunting Dog Tracking
+### Hunting
 Monitor multiple dogs during hunts with the same TAK system your hunting party uses for coordination.
 
-### Working Dog Training
+### Training
 Record and analyze training runs with full GPS tracks integrated into your existing TAK workflow.
 
-## Why Not Just Use the Alpha's Screen?
+### Why TAK Integration?
 
 The Alpha handheld shows dog positions just fine. But TAK integration gives you:
 
-- **Shared awareness**: Everyone on the TAK network sees the dog, not just the handler
-- **Track recording**: TAK Server logs the full track for after-action review
+- **Shared awareness**: Everyone on the TAK network sees the dog
+- **Track recording**: TAK Server logs the full track for AAR
 - **Integration**: Dog position alongside team members, waypoints, boundaries
-- **Redundancy**: If the handler goes down, others can still locate the dog
+- **Redundancy**: If the handler goes down, others can locate the dog
 
 ## Contributing
 
-This is an open research project. Contributions welcome:
+Contributions welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
-- 🐛 Bug reports and protocol corrections
-- 📱 Android app development
-- 🔬 Testing with different Alpha/collar models
-- 📖 Documentation improvements
+Priority areas:
+- 🔬 **Capture the init command** — Need btsnoop logs from rooted device
+- 📱 **Settings UI** — Dog names, callsigns, team assignments
+- 🐕 **Multi-dog support** — Track multiple collars with unique identifiers
+- 🔌 **ATAK plugin** — Integrated UI within ATAK itself
+- 📖 **Testing** — Other Alpha/collar models (200i, 100, T5, etc.)
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+## Legal
 
-## Legal / Disclaimer
+This project reverse-engineers Garmin's proprietary BLE protocol for interoperability with TAK systems. Not affiliated with or endorsed by Garmin Ltd.
 
-This project involves reverse engineering Garmin's proprietary BLE protocol. It is intended for interoperability purposes (enabling Garmin hardware to work with TAK systems) and falls under fair use/interoperability exceptions in most jurisdictions.
-
-**This project is not affiliated with or endorsed by Garmin Ltd. or any TAK Program office.**
-
-Use at your own risk. This is prototype software for research purposes. Do not rely on it for life-safety applications without thorough testing.
+**Use at your own risk.** This is prototype software. Do not rely on it for life-safety applications without thorough testing.
 
 ## License
 
@@ -117,11 +146,11 @@ MIT License — See [LICENSE](LICENSE) for details.
 
 ## Acknowledgments
 
-- [Gadgetbridge Project](https://gadgetbridge.org/) — Garmin BLE protocol documentation
+- [Gadgetbridge Project](https://gadgetbridge.org/) — Garmin protocol insights
 - [TAK Product Center](https://tak.gov/) — TAK ecosystem
-- Nordic Semiconductor — nRF Connect app for BLE analysis
+- Nordic Semiconductor — nRF Connect for BLE analysis
 - The SAR K9 teams who need this capability
 
 ---
 
-*Built for the handlers who go into the backcountry with their four-legged partners.*
+*Built for the handlers who go into the backcountry with their four-legged partners.* 🐕
