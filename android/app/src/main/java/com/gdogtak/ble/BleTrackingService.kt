@@ -177,7 +177,7 @@ class BleTrackingService : Service() {
                 .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
                 .build()
 
-            bleScanner?.startScan(listOf(scanFilter), scanSettings, scanCallback)
+            bleScanner?.startScan(null, scanSettings, scanCallback)
             isScanning = true
             updateStatus(Status.SCANNING, "Scanning for Alpha...")
 
@@ -209,11 +209,16 @@ class BleTrackingService : Service() {
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             val device = result.device
-            Log.i(TAG, "Found device: ${device.address}")
+            val address = device.address
+            val name = device.name ?: "Unknown"
+            Log.i(TAG, "Scan found: $address ($name)")
 
-            // Stop scanning and connect
-            stopBleScan()
-            connectToDevice(device)
+            // Connect to Garmin Alpha devices by name
+            if (name.contains("Alpha", ignoreCase = true)) {
+                Log.i(TAG, "Found Garmin Alpha! Connecting to $address...")
+                stopBleScan()
+                connectToDevice(device)
+            }
         }
 
         override fun onScanFailed(errorCode: Int) {
@@ -298,6 +303,7 @@ class BleTrackingService : Service() {
             characteristic: BluetoothGattCharacteristic,
             value: ByteArray
         ) {
+            Log.d(TAG, "onCharacteristicChanged (new API): ${value.size} bytes")
             // Parse the notification
             handleNotification(value)
         }
@@ -308,7 +314,22 @@ class BleTrackingService : Service() {
             gatt: BluetoothGatt,
             characteristic: BluetoothGattCharacteristic
         ) {
+            Log.d(TAG, "onCharacteristicChanged (old API): ${characteristic.value?.size} bytes")
             characteristic.value?.let { handleNotification(it) }
+        }
+
+        override fun onDescriptorWrite(
+            gatt: BluetoothGatt,
+            descriptor: BluetoothGattDescriptor,
+            status: Int
+        ) {
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                Log.i(TAG, "CCCD write SUCCESS - notifications should flow now")
+                updateStatus(Status.TRACKING, "Tracking active")
+            } else {
+                Log.e(TAG, "CCCD write FAILED with status: $status")
+                updateStatus(Status.ERROR, "Failed to enable notifications")
+            }
         }
     }
 
@@ -333,11 +354,11 @@ class BleTrackingService : Service() {
                     @Suppress("DEPRECATION")
                     gatt.writeDescriptor(descriptor)
                 }
-
-                updateStatus(Status.TRACKING, "Tracking active")
-                Log.i(TAG, "Notifications enabled, tracking active")
+                Log.i(TAG, "CCCD write initiated, waiting for callback...")
+                // Status update moved to onDescriptorWrite callback
             } else {
                 Log.e(TAG, "CCCD descriptor not found")
+                updateStatus(Status.ERROR, "CCCD not found")
             }
         } catch (e: SecurityException) {
             Log.e(TAG, "Security exception enabling notifications", e)
@@ -348,6 +369,8 @@ class BleTrackingService : Service() {
      * Handle incoming BLE notification with position data
      */
     private fun handleNotification(data: ByteArray) {
+        Log.d(TAG, "Received notification: ${data.size} bytes")
+
         val position = GarminProtocol.parseNotification(data)
 
         if (position != null && position.isCollar) {
