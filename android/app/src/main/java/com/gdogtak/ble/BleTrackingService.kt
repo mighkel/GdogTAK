@@ -208,6 +208,7 @@ class BleTrackingService : Service() {
     
     /**
      * Start BLE scan for Garmin Alpha devices
+     * Uses device name filtering since Alpha may not advertise service UUID
      */
     private fun startBleScan() {
         if (isScanning) return
@@ -218,20 +219,17 @@ class BleTrackingService : Service() {
         }
         
         try {
-            val scanFilter = ScanFilter.Builder()
-                // Filter by Garmin service UUID
-                .setServiceUuid(android.os.ParcelUuid.fromString(GarminProtocol.SERVICE_UUID))
-                .build()
-            
+            // Scan without filters - we'll filter by device name in the callback
+            // The Alpha doesn't reliably advertise its service UUID
             val scanSettings = ScanSettings.Builder()
                 .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
                 .build()
             
-            bleScanner?.startScan(listOf(scanFilter), scanSettings, scanCallback)
+            bleScanner?.startScan(null, scanSettings, scanCallback)
             isScanning = true
             updateStatus(Status.SCANNING, "Scanning for Alpha...")
             
-            Log.i(TAG, "BLE scan started")
+            Log.i(TAG, "BLE scan started (name-based filtering)")
         } catch (e: SecurityException) {
             updateStatus(Status.ERROR, "Bluetooth permission denied")
             Log.e(TAG, "Security exception starting scan", e)
@@ -254,16 +252,27 @@ class BleTrackingService : Service() {
     }
     
     /**
-     * BLE scan callback
+     * BLE scan callback - filters by device name containing "Alpha"
      */
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             val device = result.device
-            Log.i(TAG, "Found device: ${device.address}")
+            var deviceName: String? = null
             
-            // Stop scanning and connect
-            stopBleScan()
-            connectToDevice(device)
+            try {
+                deviceName = device.name
+            } catch (e: SecurityException) {
+                Log.w(TAG, "Cannot get device name: ${e.message}")
+            }
+            
+            // Filter for Garmin Alpha devices by name
+            if (deviceName != null && deviceName.contains("Alpha", ignoreCase = true)) {
+                Log.i(TAG, "Found Alpha device: $deviceName (${device.address})")
+                
+                // Stop scanning and connect
+                stopBleScan()
+                connectToDevice(device)
+            }
         }
         
         override fun onScanFailed(errorCode: Int) {
