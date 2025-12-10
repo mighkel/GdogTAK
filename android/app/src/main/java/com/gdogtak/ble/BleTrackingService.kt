@@ -381,17 +381,20 @@ class BleTrackingService : Service() {
             descriptor: BluetoothGattDescriptor,
             status: Int
         ) {
+            val charUuid = descriptor.characteristic.uuid.toString().takeLast(8)
             if (status == BluetoothGatt.GATT_SUCCESS) {
-                Log.d(TAG, "CCCD write success for: ${descriptor.characteristic.uuid}")
+                Log.i(TAG, ">>> CCCD written OK for: $charUuid")
             } else {
-                Log.e(TAG, "CCCD write failed: $status for ${descriptor.characteristic.uuid}")
+                Log.e(TAG, ">>> CCCD write FAILED: $status for $charUuid")
             }
             
             // Write next CCCD or start init sequence
             bleHandler.postDelayed({
                 if (cccdWriteQueue.isNotEmpty()) {
+                    Log.d(TAG, "CCCD queue remaining: ${cccdWriteQueue.size}")
                     writeNextCccd(gatt)
                 } else if (!initSequenceStarted) {
+                    Log.i(TAG, ">>> ALL CCCDs done - Starting init sequence!")
                     startInitSequence(gatt)
                 }
             }, CCCD_WRITE_DELAY_MS)
@@ -543,24 +546,36 @@ class BleTrackingService : Service() {
      * Handle incoming BLE notification with position data
      */
     private fun handleNotification(charUuid: String, data: ByteArray) {
-        // Log raw data for debugging
+        // Log ALL notifications for debugging
+        Log.i(TAG, ">>> BLE NOTIFICATION received! Char: ${charUuid.takeLast(8)}, Size: ${data.size}")
+        
         if (data.size > 10) {
-            Log.v(TAG, "Notification from $charUuid: ${data.take(20).toByteArray().toHexString()}...")
+            Log.d(TAG, "Raw data: ${data.take(40).toByteArray().toHexString()}")
         }
         
         val position = GarminProtocol.parseNotification(data)
         
-        if (position != null && position.isCollar) {
+        if (position == null) {
+            Log.d(TAG, "Parse result: null (no valid position found)")
+            return
+        }
+        
+        Log.i(TAG, ">>> PARSED: isCollar=${position.isCollar}, lat=${position.latitude}, lon=${position.longitude}")
+        
+        if (position.isCollar) {
             positionCount++
             lastPosition = position
             
-            Log.d(TAG, "Dog position #$positionCount: ${position.latitude}, ${position.longitude}")
+            Log.i(TAG, ">>> DOG POSITION #$positionCount: ${position.latitude}, ${position.longitude}")
             
             // Generate and send CoT
             val cot = CotGenerator.generateCot(position, dogConfig)
+            Log.d(TAG, ">>> Generated CoT for ${dogConfig.callsign}")
             
             serviceScope.launch {
                 val sent = atakBroadcaster.sendCot(cot)
+                Log.i(TAG, ">>> CoT SENT: $sent")
+                
                 if (sent) {
                     updateStatus(
                         Status.TRACKING, 
@@ -568,11 +583,15 @@ class BleTrackingService : Service() {
                         position.latitude,
                         position.longitude
                     )
+                } else {
+                    Log.e(TAG, ">>> CoT send FAILED!")
                 }
             }
             
             // Update notification
             updateNotification("Tracking: ${position.latitude.format(5)}, ${position.longitude.format(5)}")
+        } else {
+            Log.d(TAG, "Skipping handheld position (not collar)")
         }
     }
     

@@ -55,16 +55,30 @@ object GarminProtocol {
      * @return DogPosition if valid position found, null otherwise
      */
     fun parseNotification(data: ByteArray): DogPosition? {
-        if (data.size < 20) return null
+        if (data.size < 20) {
+            android.util.Log.d("GarminProtocol", "Packet too small: ${data.size} bytes")
+            return null
+        }
         
         // Determine device type
         val isCollar = isCollarMessage(data)
         val isHandheld = isHandheldMessage(data)
         
-        if (!isCollar && !isHandheld) return null
+        android.util.Log.d("GarminProtocol", "Device type: collar=$isCollar, handheld=$isHandheld")
+        
+        if (!isCollar && !isHandheld) {
+            android.util.Log.d("GarminProtocol", "No device marker found (02 35 or 02 28)")
+            return null
+        }
         
         // Find and decode coordinates
-        val coords = findCoordinates(data) ?: return null
+        val coords = findCoordinates(data)
+        if (coords == null) {
+            android.util.Log.d("GarminProtocol", "No coordinates found in packet")
+            return null
+        }
+        
+        android.util.Log.i("GarminProtocol", ">>> COORDS PARSED: lat=${coords.first}, lon=${coords.second}, isCollar=$isCollar")
         
         return DogPosition(
             latitude = coords.first,
@@ -116,6 +130,7 @@ object GarminProtocol {
                 data[i + 1] == 0x0C.toByte() && 
                 data[i + 2] == 0x08.toByte()) {
                 
+                android.util.Log.d("GarminProtocol", "Found 0A 0C 08 at index $i")
                 val result = tryDecodeCoordinates(data, i + 3)
                 if (result != null) return result
             }
@@ -127,10 +142,12 @@ object GarminProtocol {
                 data[i + 3] == 0x0C.toByte() &&
                 data[i + 4] == 0x08.toByte()) {
                 
+                android.util.Log.d("GarminProtocol", "Found nested 0A XX 0A 0C 08 at index $i")
                 val result = tryDecodeCoordinates(data, i + 5)
                 if (result != null) return result
             }
         }
+        android.util.Log.d("GarminProtocol", "No coordinate signature found in ${data.size} bytes")
         return null
     }
     
