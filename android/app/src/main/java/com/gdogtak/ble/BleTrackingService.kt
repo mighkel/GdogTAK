@@ -94,6 +94,11 @@ class BleTrackingService : Service() {
     private var initSequenceStarted = false
     private var cccdWriteQueue: MutableList<BluetoothGattDescriptor> = mutableListOf()
     private var writeCharacteristic: BluetoothGattCharacteristic? = null
+    private var writeCharacteristic2: BluetoothGattCharacteristic? = null  // Second write char for dual init
+    
+    // Dynamically assigned data channel from Alpha
+    private var assignedChannel: Byte = 0x0f  // Default, will be updated from response
+    private var channelPrefix: Byte = 0x2f  // Channel prefix from device, varies each session
     
     // Device ID for init sequence (generated once per app install)
     private var deviceId: ByteArray? = null
@@ -128,9 +133,19 @@ class BleTrackingService : Service() {
     
     /**
      * Generate an 8-byte device ID for the Garmin init sequence.
-     * Uses Android ID as seed for consistency across sessions.
+     * TESTING: Using known-working ID from btsnoop capture.
      */
     private fun generateDeviceId(): ByteArray {
+        // Known working device ID from btsnoop capture (Garmin Explore session)
+        // This ID successfully triggered position streaming on the Alpha 300i
+        val knownWorkingId = byteArrayOf(
+            0x8d.toByte(), 0x3d.toByte(), 0xb0.toByte(), 0xe5.toByte(),
+            0x92.toByte(), 0x59.toByte(), 0x03.toByte(), 0x3d.toByte()
+        )
+        Log.i(TAG, "Using known-working device ID from btsnoop")
+        return knownWorkingId
+        
+        /* Original dynamic generation - uncomment once streaming works
         val androidId = Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID)
         val hash = androidId.hashCode().toLong()
         val time = System.currentTimeMillis()
@@ -146,6 +161,7 @@ class BleTrackingService : Service() {
             ((combined shr 8) and 0xFF).toByte(),
             (combined and 0xFF).toByte()
         )
+        */
     }
     
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -331,35 +347,89 @@ class BleTrackingService : Service() {
             
             Log.i(TAG, "Services discovered")
             
+            // DEBUG: List ALL services found on device
+            Log.i(TAG, "=== ALL SERVICES ON DEVICE ===")
+            for (svc in gatt.services) {
+                Log.i(TAG, "Service: ${svc.uuid}")
+                Log.i(TAG, "  Type: ${if (svc.type == BluetoothGattService.SERVICE_TYPE_PRIMARY) "PRIMARY" else "SECONDARY"}")
+                Log.i(TAG, "  Characteristics: ${svc.characteristics.size}")
+                for (char in svc.characteristics) {
+                    val propsStr = buildString {
+                        if (char.properties and BluetoothGattCharacteristic.PROPERTY_READ != 0) append("R")
+                        if (char.properties and BluetoothGattCharacteristic.PROPERTY_WRITE != 0) append("W")
+                        if (char.properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0) append("w")
+                        if (char.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0) append("N")
+                        if (char.properties and BluetoothGattCharacteristic.PROPERTY_INDICATE != 0) append("I")
+                    }
+                    Log.i(TAG, "    ${char.uuid} inst=${char.instanceId} props=$propsStr")
+                }
+            }
+            
             // Find the Garmin service
             val service = gatt.getService(UUID.fromString(GarminProtocol.SERVICE_UUID))
             if (service == null) {
-                Log.e(TAG, "Garmin service not found")
-                updateStatus(Status.ERROR, "Garmin service not found")
+                Log.e(TAG, "Garmin service not found: ${GarminProtocol.SERVICE_UUID}")
+                Log.e(TAG, ">>> The Alpha may need to be paired/bonded first!")
+                Log.e(TAG, ">>> Try: Settings > Bluetooth > Pair with Alpha")
+                updateStatus(Status.ERROR, "Garmin service not found - try pairing first")
                 return
             }
             
-            // Get the write characteristic for init sequence
-            writeCharacteristic = service.getCharacteristic(
-                UUID.fromString(GarminProtocol.WRITE_CHAR_UUID)
-            )
-            if (writeCharacteristic == null) {
-                Log.w(TAG, "Write characteristic not found, init sequence may fail")
-            } else {
-                Log.i(TAG, "Write characteristic found: ${GarminProtocol.WRITE_CHAR_UUID}")
+            Log.i(TAG, ">>> Found Garmin service: ${service.uuid}")
+            
+            // DEBUG: List ALL characteristics in the service to see handles
+            Log.i(TAG, "=== ALL CHARACTERISTICS IN GARMIN SERVICE ===")
+            for (char in service.characteristics) {
+                val propsStr = buildString {
+                    if (char.properties and BluetoothGattCharacteristic.PROPERTY_READ != 0) append("R")
+                    if (char.properties and BluetoothGattCharacteristic.PROPERTY_WRITE != 0) append("W")
+                    if (char.properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0) append("w")
+                    if (char.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0) append("N")
+                    if (char.properties and BluetoothGattCharacteristic.PROPERTY_INDICATE != 0) append("I")
+                }
+                Log.i(TAG, "  Char: ${char.uuid.toString().takeLast(8)} instance=${char.instanceId} props=$propsStr (${char.properties})")
             }
             
-            // Build list of all characteristics to subscribe to
+            // Find write characteristics - get FIRST instance (lowest instanceId)
+            // Alpha app uses specific instances that receive collar data
+            val writeUuid1 = UUID.fromString(GarminProtocol.WRITE_CHAR_UUID)
+            val writeUuid2 = UUID.fromString(GarminProtocol.WRITE_CHAR_UUID_2)
+            
+            writeCharacteristic = service.characteristics
+                .filter { it.uuid == writeUuid1 }
+                .minByOrNull { it.instanceId }
+            writeCharacteristic2 = service.characteristics
+                .filter { it.uuid == writeUuid2 }
+                .minByOrNull { it.instanceId }
+            
+            if (writeCharacteristic == null) {
+                Log.w(TAG, "Write characteristic 1 not found, init sequence may fail")
+            } else {
+                Log.i(TAG, "Write characteristic 1 found: ${GarminProtocol.WRITE_CHAR_UUID} instance=${writeCharacteristic?.instanceId}")
+            }
+            if (writeCharacteristic2 == null) {
+                Log.w(TAG, "Write characteristic 2 not found")
+            } else {
+                Log.i(TAG, "Write characteristic 2 found: ${GarminProtocol.WRITE_CHAR_UUID_2} instance=${writeCharacteristic2?.instanceId}")
+            }
+            
+            // Build list of FIRST instance of each notification characteristic to subscribe to
+            // Alpha subscribes to ONE specific instance that receives collar data
             cccdWriteQueue.clear()
             val cccdUuid = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
             
             for (charUuid in GarminProtocol.NOTIFY_CHAR_UUIDS) {
-                val characteristic = service.getCharacteristic(UUID.fromString(charUuid))
+                val uuid = UUID.fromString(charUuid)
+                // Get FIRST instance (lowest instanceId) of this characteristic
+                val characteristic = service.characteristics
+                    .filter { it.uuid == uuid }
+                    .minByOrNull { it.instanceId }
+                    
                 if (characteristic != null) {
                     val descriptor = characteristic.getDescriptor(cccdUuid)
                     if (descriptor != null) {
                         cccdWriteQueue.add(descriptor)
-                        Log.i(TAG, "Queued subscription for: $charUuid")
+                        Log.i(TAG, "Queued subscription for: $charUuid instance=${characteristic.instanceId}")
                     }
                 } else {
                     Log.w(TAG, "Characteristic not found: $charUuid")
@@ -481,65 +551,420 @@ class BleTrackingService : Service() {
         Log.i(TAG, "Starting Garmin Alpha init sequence")
         Log.d(TAG, "Device ID: ${id.toHexString()}")
         
-        // Build init commands
-        val commands = mutableListOf<ByteArray>()
-        
-        // Step 1: Device ID exchange
-        commands.add(byteArrayOf(0x00, 0x05) + id + byteArrayOf(0x00, 0x00))
-        commands.add(byteArrayOf(0x00, 0x00) + id + byteArrayOf(0x04, 0x00, 0x00))
-        
-        // Step 2: Enable 5 channels
-        for (channel in 0..4) {
-            commands.add(byteArrayOf(0x15, channel.toByte()))
-        }
-        
-        // Step 3: Start streaming
-        commands.add(byteArrayOf(0x16, 0x01, 0x19, 0x00, 0x00, 0x00))
-        
-        // Send commands with delays
-        sendInitCommands(gatt, writeChar, commands, 0)
+        // Send commands in phases, generating each command just before sending
+        // This ensures we use the dynamically assigned channel prefix
+        sendInitPhase1(gatt, writeChar, id)
     }
     
     /**
-     * Send init commands sequentially with delays
+     * Phase 1: Device ID exchange
      */
-    private fun sendInitCommands(
-        gatt: BluetoothGatt,
-        characteristic: BluetoothGattCharacteristic,
-        commands: List<ByteArray>,
-        index: Int
-    ) {
-        if (index >= commands.size) {
-            Log.i(TAG, "Init sequence complete!")
-            updateStatus(Status.TRACKING, "Tracking active (standalone)")
-            return
+    private fun sendInitPhase1(gatt: BluetoothGatt, char: BluetoothGattCharacteristic, id: ByteArray) {
+        val cmd1 = byteArrayOf(0x00, 0x05).plus(id).plus(byteArrayOf(0x00, 0x00))
+        val cmd2 = byteArrayOf(0x00, 0x00).plus(id).plus(byteArrayOf(0x04, 0x00, 0x00))
+        
+        Log.d(TAG, "Init phase 1 - Device ID exchange")
+        sendCommand(gatt, char, cmd1, "ID send")
+        
+        bleHandler.postDelayed({
+            sendCommand(gatt, char, cmd2, "ID confirm")
+            
+            // Wait for response with channel prefix, then continue
+            bleHandler.postDelayed({
+                sendInitPhase2(gatt, char, id)
+            }, 300)  // Wait for prefix response
+        }, INIT_STEP_DELAY_MS)
+    }
+    
+    /**
+     * Phase 2: Channel enables (uses dynamically assigned prefix)
+     */
+    private fun sendInitPhase2(gatt: BluetoothGatt, char: BluetoothGattCharacteristic, id: ByteArray) {
+        Log.d(TAG, "Init phase 2 - Channel enables with prefix 0x${"%02x".format(channelPrefix)}")
+        
+        var delay = 0L
+        for (channel in 0..4) {
+            bleHandler.postDelayed({
+                val cmd = byteArrayOf(channelPrefix, channel.toByte())
+                sendCommand(gatt, char, cmd, "Channel $channel")
+            }, delay)
+            delay += INIT_STEP_DELAY_MS
         }
         
-        val command = commands[index]
-        Log.d(TAG, "Init step ${index + 1}/${commands.size}: ${command.toHexString()}")
+        bleHandler.postDelayed({
+            sendInitPhase3(gatt, char, id)
+        }, delay)
+    }
+    
+    /**
+     * Phase 3: Subscriptions and start streaming
+     */
+    private fun sendInitPhase3(gatt: BluetoothGatt, char: BluetoothGattCharacteristic, id: ByteArray) {
+        Log.d(TAG, "Init phase 3 - Subscriptions")
         
-        try {
-            // Set write type to no response for speed
-            characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+        val cmd1 = byteArrayOf(0x00, 0x00).plus(id).plus(byteArrayOf(0x16, 0x00, 0x00))
+        val cmd2 = byteArrayOf(0x00, 0x00).plus(id).plus(byteArrayOf(0x01, 0x00, 0x00))  // 01 00 00 like Alpha!
+        val streamPrefix = (channelPrefix.toInt() + 1).toByte()
+        val cmd3 = byteArrayOf(streamPrefix, 0x01, 0x19, 0x00, 0x00, 0x00)
+        
+        sendCommand(gatt, char, cmd1, "Subscribe ch16")
+        
+        bleHandler.postDelayed({
+            sendCommand(gatt, char, cmd2, "Subscribe ch01")
+        }, INIT_STEP_DELAY_MS)
+        
+        bleHandler.postDelayed({
+            sendCommand(gatt, char, cmd3, "Start streaming (prefix 0x${"%02x".format(streamPrefix)})")
             
+            // Wait for channel assignment, then send device registration
+            bleHandler.postDelayed({
+                Log.i(TAG, "Basic init complete, channel 0x${"%02x".format(assignedChannel)}")
+                sendDeviceRegistration(gatt, char)
+            }, 500)
+        }, INIT_STEP_DELAY_MS * 2)
+    }
+    
+    /**
+     * Helper to send a single command
+     */
+    private fun sendCommand(gatt: BluetoothGatt, char: BluetoothGattCharacteristic, cmd: ByteArray, desc: String) {
+        Log.d(TAG, "Init: $desc -> ${cmd.toHexString()}")
+        try {
+            char.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                gatt.writeCharacteristic(characteristic, command, BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE)
+                gatt.writeCharacteristic(char, cmd, BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE)
             } else {
                 @Suppress("DEPRECATION")
-                characteristic.value = command
+                char.value = cmd
+                @Suppress("DEPRECATION")
+                gatt.writeCharacteristic(char)
+            }
+        } catch (e: SecurityException) {
+            Log.e(TAG, "Command failed: $desc", e)
+        }
+    }
+    
+    /**
+     * Send device registration packet
+     * Based on Alpha app protocol - NO channel prefix, just raw 02 44 format
+     */
+    private fun sendDeviceRegistration(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
+        Log.i(TAG, "Sending device registration (channel 0x${"%02x".format(assignedChannel)} assigned)")
+        
+        // Channel prefix for config commands = channelPrefix + 2
+        // e.g., if prefix is 0x15, config prefix is 0x17
+        val configPrefix = (channelPrefix + 2).toByte()
+        Log.d(TAG, "Config command prefix: 0x${"%02x".format(configPrefix)}")
+        
+        // Build device registration WITH channel prefix!
+        // Format: [prefix+2] 00 02 44 [params] [device_name] [manufacturer] [model]
+        val deviceRegBase = byteArrayOf(
+            0x02, 0x44,  // command type
+            0x05, 0x88.toByte(), 0x13, 0xa0.toByte(), 0x13, 
+            0x02, 0x96.toByte(), 0x3c, 
+            0xff.toByte(), 0xff.toByte(), 0xff.toByte(), 0xff.toByte(), 
+            0xff.toByte(), 0xff.toByte(), 0xff.toByte(), 0xff.toByte(),
+            0xb5.toByte(), 0x55, 0xff.toByte(), 0xff.toByte(),
+            // Device name: "GdogTAK" (7 chars) - length-prefixed
+            0x07, 0x47, 0x64, 0x6f, 0x67, 0x54, 0x41, 0x4b,
+            // Manufacturer: "ATAK" (4 chars)  
+            0x04, 0x41, 0x54, 0x41, 0x4b,
+            // Model: "GdogTAK-v1" (10 chars)
+            0x0a, 0x47, 0x64, 0x6f, 0x67, 0x54, 0x41, 0x4b, 0x2d, 0x76, 0x31,
+            // Terminator
+            0x01, 0xf8.toByte(), 0xa4.toByte(), 0x00
+        )
+        // Prepend channel prefix - build explicitly to avoid any array issues
+        val deviceRegPacket = ByteArray(2 + deviceRegBase.size)
+        deviceRegPacket[0] = configPrefix
+        deviceRegPacket[1] = 0x00
+        System.arraycopy(deviceRegBase, 0, deviceRegPacket, 2, deviceRegBase.size)
+        
+        Log.d(TAG, "Device reg packet size: ${deviceRegPacket.size}, first 4 bytes: ${deviceRegPacket.copyOf(4).toHexString()}")
+        
+        // Config commands - all need [prefix+2] 00 header prepended
+        // Build explicitly to ensure prefix is included
+        val configCommandsBase = listOf(
+            // Position subscribe: 02 09 01 04 81 ba 13 03 9d e9 00
+            byteArrayOf(0x02, 0x09, 0x01, 0x04, 
+                0x81.toByte(), 0xba.toByte(), 0x13, 0x03, 0x9d.toByte(), 0xe9.toByte(), 0x00),
+            // Config 0x13 (NOT 0x16!): 02 13 06 32 80 0c 50 06 02 14 01 02 04 07 a0 20 13 1d 11 93 00
+            byteArrayOf(0x02, 0x13, 0x06, 0x32, 
+                0x80.toByte(), 0x0c, 0x50, 0x06, 0x02, 0x14, 0x01, 0x02, 0x04, 0x07,
+                0xa0.toByte(), 0x20, 0x13, 0x1d, 0x11, 0x93.toByte(), 0x00),
+            // DOG LIST SYNC - 02 26 command that triggers collar data relay!
+            byteArrayOf(0x02, 0x26, 0x03, 0x2b, 0x81.toByte(),
+                0x01, 0x01, 0x01, 0x01, 0x01, 0x02, 0x12, 0x01, 0x01, 0x02, 0x12,
+                0x01, 0x01, 0x12, 0x6a, 0x10, 0x42, 0x0e, 0x62, 0x04, 0x08,
+                0x80.toByte(), 0x86.toByte(), 0x1c, 0x6a, 0x02, 0x08, 0x02, 0x72, 0x02, 0x08, 0x03,
+                0x06, 0x56, 0x00)
+            // Note: Collar slot registrations (02 11) will be added dynamically below
+        )
+        
+        // Hardcoded collar slot registrations from Dec 8 working session
+        // These have correct checksums - one per slot 80-9f
+        val collarSlotCommands = listOf(
+            // Slot 80
+            bytes("0211010480b41302180101010101010361b000"),
+            // Slot 81
+            bytes("0211010481b4130219010101010101035dbf00"),
+            // Slot 82
+            bytes("0211010482b41301010101010101010398dd00"),
+            // Slot 83
+            bytes("0211010483b413021b0101010101010325a100"),
+            // Slot 84
+            bytes("0211010484b413023401010101010103923200"),
+            // Slot 85 - CRITICAL: This is the collar slot from Dec 8!
+            bytes("0211010485b413020101010101010103acda00"),
+            // Slot 86
+            bytes("0211010486b413020201010101010103e8cb00"),
+            // Slot 87
+            bytes("0211010487b413020301010101010103d4c400"),
+            // Slot 88
+            bytes("0211010488b413020401010101010103813600"),
+            // Slot 89
+            bytes("0211010489b413020501010101010103bd3900"),
+            // Slot 8a
+            bytes("021101048ab41302070101010101010338e400"),
+            // Slot 8b
+            bytes("021101048bb41302060101010101010304eb00"),
+            // Slot 8c
+            bytes("021101048cb41302080101010101010370ac00"),
+            // Slot 8d
+            bytes("021101048db4130209010101010101034ca300"),
+            // Slot 8e
+            bytes("021101048eb413020a0101010101010308b200"),
+            // Slot 8f
+            bytes("021101048fb413020b0101010101010334bd00"),
+            // Slot 90
+            bytes("0211010490b413020c01010101010103a0b000"),
+            // Slot 91
+            bytes("0211010491b413020d010101010101039cbf00"),
+            // Slot 92
+            bytes("0211010492b413021f01010101010103186e00"),
+            // Slot 93
+            bytes("0211010493b413020e01010101010103256d00"),
+            // Slot 94
+            bytes("0211010494b413022001010101010103533200"),
+            // Slot 95
+            bytes("0211010495b413020f01010101010103eca900"),
+            // Slot 96
+            bytes("0211010496b413021001010101010103a9e100"),
+            // Slot 97
+            bytes("0211010497b41302110101010101010395ee00"),
+            // Slot 98
+            bytes("0211010498b413021201010101010103c1ef00"),
+            // Slot 99
+            bytes("0211010499b413021301010101010103fde000"),
+            // Slot 9a
+            bytes("021101049ab413021401010101010103b80200"),
+            // Slot 9b
+            bytes("021101049bb413021501010101010103840d00"),
+            // Slot 9c
+            bytes("021101049cb41302160101010101010331d300"),
+            // Slot 9d
+            bytes("021101049db4130223010101010101030f3b00"),
+            // Slot 9e
+            bytes("021101049eb41302170101010101010309d800")
+        )
+        Log.d(TAG, "Using ${collarSlotCommands.size} hardcoded collar slot registrations from Dec 8")
+        
+        // Combine base config + collar slots + remaining commands
+        val remainingCommands = listOf(
+            // Enable streaming: 02 06 05 1f 82 88 d9 00
+            byteArrayOf(0x02, 0x06, 0x05, 0x1f, 
+                0x82.toByte(), 0x88.toByte(), 0xd9.toByte(), 0x00),
+            // Polling config: 02 08 04 1e 83 08 03 f1 48 00
+            byteArrayOf(0x02, 0x08, 0x04, 0x1e, 
+                0x83.toByte(), 0x08, 0x03, 0xf1.toByte(), 0x48, 0x00),
+            // Device list query: 02 52 03 2b 81...
+            byteArrayOf(0x02, 0x52, 0x03, 0x2b, 0x81.toByte(),
+                0x01, 0x01, 0x01, 0x01, 0x01, 0x02, 0x3e, 0x01, 0x01, 0x02, 0x3e,
+                0x01, 0x01, 0x32, 0x6a, 0x3c, 0x42, 0x3a, 0x0a, 0x24,
+                0x34, 0x37, 0x31, 0x65, 0x39, 0x35, 0x39, 0x30, 0x2d, 0x38, 0x36,
+                0x39, 0x36, 0x2d, 0x34, 0x61, 0x31, 0x39, 0x2d, 0x39, 0x64, 0x31,
+                0x39, 0x2d, 0x35, 0x39, 0x37, 0x62, 0x36, 0x33, 0x39, 0x31, 0x38,
+                0x30, 0x39, 0x37,
+                0x6a, 0x02, 0x08, 0x02, 0x72, 0x02, 0x08, 0x05, 0xb2.toByte(), 0x01, 0x02, 0x08, 0x0a,
+                0xc2.toByte(), 0x01, 0x04, 0x08, 0x01, 0x10, 0x01, 0xfb.toByte(), 0xd3.toByte(), 0x00),
+            // Additional poll commands
+            byteArrayOf(0x02, 0x1d, 0x04, 0x2b, 0x84.toByte(),
+                0x01, 0x01, 0x01, 0x01, 0x01, 0x02, 0x09, 0x01, 0x01, 0x02, 0x09, 0x01,
+                0x01, 0x0c, 0xea.toByte(), 0x01, 0x06, 0x0a, 0x04, 0x0a, 0x02, 0x10, 0x0b,
+                0xe3.toByte(), 0x7b, 0x00),
+            byteArrayOf(0x02, 0x1d, 0x04, 0x2b, 0x85.toByte(),
+                0x02, 0x01, 0x01, 0x01, 0x01, 0x02, 0x09, 0x01, 0x01, 0x02, 0x09, 0x01,
+                0x01, 0x0c, 0xda.toByte(), 0x02, 0x06, 0x4a, 0x04, 0x32, 0x02, 0x08, 0x03,
+                0xf6.toByte(), 0x79, 0x00)
+        )
+        
+        // Combine all commands: base config + collar slots + remaining
+        val allCommandsBase = configCommandsBase + collarSlotCommands + remainingCommands
+        
+        // Prepend channel prefix to all config commands - build explicitly
+        val configCommands = allCommandsBase.map { cmd ->
+            val prefixedCmd = ByteArray(2 + cmd.size)
+            prefixedCmd[0] = configPrefix
+            prefixedCmd[1] = 0x00
+            System.arraycopy(cmd, 0, prefixedCmd, 2, cmd.size)
+            prefixedCmd
+        }
+        
+        Log.d(TAG, "Total config commands: ${configCommands.size} (including ${collarSlotCommands.size} collar slots)")
+        Log.d(TAG, "Device registration: ${deviceRegPacket.toHexString()}")
+        Log.d(TAG, "First config cmd size: ${configCommands[0].size}, first 4 bytes: ${configCommands[0].copyOf(4).toHexString()}")
+        
+        try {
+            characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+            
+            // Send device registration - log exactly what we're about to write
+            Log.d(TAG, ">>> WRITING device reg (${deviceRegPacket.size} bytes): ${deviceRegPacket.copyOf(6).toHexString()}...")
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                Log.d(TAG, "Using Android 13+ write API")
+                gatt.writeCharacteristic(characteristic, deviceRegPacket, BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE)
+            } else {
+                Log.d(TAG, "Using deprecated write API")
+                @Suppress("DEPRECATION")
+                characteristic.value = deviceRegPacket
+                val charVal = characteristic.value
+                Log.d(TAG, "Char value set to (${charVal?.size} bytes): ${charVal?.copyOf(6)?.toHexString()}...")
                 @Suppress("DEPRECATION")
                 gatt.writeCharacteristic(characteristic)
             }
             
-            // Schedule next command
+            // Send config commands with delays
+            var delay = 200L
+            for (cmd in configCommands) {
+                bleHandler.postDelayed({
+                    Log.d(TAG, ">>> WRITING config (${cmd.size} bytes): ${cmd.copyOf(6).toHexString()}...")
+                    try {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                            gatt.writeCharacteristic(characteristic, cmd, BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE)
+                        } else {
+                            @Suppress("DEPRECATION")
+                            characteristic.value = cmd
+                            @Suppress("DEPRECATION")
+                            gatt.writeCharacteristic(characteristic)
+                        }
+                    } catch (e: SecurityException) {
+                        Log.e(TAG, "Config command failed", e)
+                    }
+                }, delay)
+                delay += 200L
+            }
+            
             bleHandler.postDelayed({
-                sendInitCommands(gatt, characteristic, commands, index + 1)
-            }, INIT_STEP_DELAY_MS)
+                Log.i(TAG, "Init sequence on char1 complete!")
+                
+                // Now do second init on characteristic 2 (6a4e2820)
+                // Alpha app inits on BOTH characteristics!
+                val writeChar2 = writeCharacteristic2
+                if (writeChar2 != null) {
+                    Log.i(TAG, "Starting second init on ${GarminProtocol.WRITE_CHAR_UUID_2}")
+                    startSecondInit(gatt, writeChar2)
+                } else {
+                    Log.w(TAG, "Second write characteristic not available, skipping")
+                    updateStatus(Status.TRACKING, "Tracking active (standalone)")
+                }
+            }, delay)
             
         } catch (e: SecurityException) {
-            Log.e(TAG, "Security exception in init sequence", e)
-            updateStatus(Status.ERROR, "Init sequence failed: permission denied")
+            Log.e(TAG, "Security exception sending device registration", e)
+            updateStatus(Status.ERROR, "Device registration failed")
         }
+    }
+    
+    /**
+     * Second init phase on characteristic 2 (6a4e2820)
+     * Alpha app sends to BOTH characteristics - this may be what triggers collar data routing
+     */
+    private fun startSecondInit(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
+        // Commands for second characteristic (from Alpha btsnoop frames 292-340)
+        // These use shortened ID format
+        val id = generateDeviceId()
+        val shortId = id.sliceArray(2 until 8)  // Skip first 2 bytes of ID
+        
+        val commands = mutableListOf<ByteArray>()
+        
+        // Step 1: Send shortened device ID
+        commands.add(shortId.plus(byteArrayOf(0x00, 0x00)))
+        
+        // Step 2: Confirm device ID  
+        commands.add(shortId.plus(byteArrayOf(0x04, 0x00, 0x00)))
+        
+        // Step 3: Empty commands (channel enables already done)
+        for (i in 0..4) {
+            commands.add(byteArrayOf())  // Empty writes
+        }
+        
+        // Step 4: Channel subscriptions with short ID
+        commands.add(shortId.plus(byteArrayOf(0x16, 0x00, 0x00)))
+        commands.add(shortId.plus(byteArrayOf(0x01, 0x00, 0x00)))  // 01 00 00 like Alpha!
+        
+        // Step 5: Start streaming
+        commands.add(byteArrayOf(0x00, 0x00, 0x00))
+        
+        // Step 6: Device registration (no prefix)
+        commands.add(byteArrayOf(
+            0x02, 0x44, 0x05, 0x88.toByte(), 0x13, 0xa0.toByte(), 0x13, 
+            0x02, 0x96.toByte(), 0x3c,
+            0xff.toByte(), 0xff.toByte(), 0xff.toByte(), 0xff.toByte(),
+            0xff.toByte(), 0xff.toByte(), 0xff.toByte(), 0xff.toByte(),
+            0xb5.toByte(), 0x55, 0xff.toByte(), 0xff.toByte(),
+            0x07, 0x47, 0x64, 0x6f, 0x67, 0x54, 0x41, 0x4b,  // "GdogTAK"
+            0x04, 0x41, 0x54, 0x41, 0x4b,  // "ATAK"
+            0x0a, 0x47, 0x64, 0x6f, 0x67, 0x54, 0x41, 0x4b, 0x2d, 0x76, 0x31,  // "GdogTAK-v1"
+            0x01, 0xf8.toByte(), 0xa4.toByte(), 0x00
+        ))
+        
+        // Step 7: Config commands
+        commands.add(byteArrayOf(0x02, 0x09, 0x01, 0x04, 
+            0x81.toByte(), 0xba.toByte(), 0x13, 0x03, 0x9d.toByte(), 0xe9.toByte(), 0x00))
+        commands.add(byteArrayOf(0x02, 0x13, 0x06, 0x32, 
+            0x80.toByte(), 0x0c, 0x50, 0x06, 0x02, 0x14, 0x01, 0x02, 0x04, 0x07,
+            0xa0.toByte(), 0x20, 0x13, 0x1d, 0x11, 0x93.toByte(), 0x00))
+        
+        // Device list query
+        commands.add(byteArrayOf(0x02, 0x52, 0x03, 0x2b, 0x81.toByte(),
+            0x01, 0x01, 0x01, 0x01, 0x01, 0x02, 0x3e, 0x01, 0x01, 0x02, 0x3e,
+            0x01, 0x01, 0x32, 0x6a, 0x3c, 0x42, 0x3a, 0x0a, 0x24,
+            0x34, 0x37, 0x31, 0x65, 0x39, 0x35, 0x39, 0x30, 0x2d, 0x38, 0x36,
+            0x39, 0x36, 0x2d, 0x34, 0x61, 0x31, 0x39, 0x2d, 0x39, 0x64, 0x31,
+            0x39, 0x2d, 0x35, 0x39, 0x37, 0x62, 0x36, 0x33, 0x39, 0x31, 0x38,
+            0x30, 0x39, 0x37,
+            0x6a, 0x02, 0x08, 0x02, 0x72, 0x02, 0x08, 0x05, 0xb2.toByte(), 0x01, 0x02, 0x08, 0x0a,
+            0xc2.toByte(), 0x01, 0x04, 0x08, 0x01, 0x10, 0x01, 0xfb.toByte(), 0xd3.toByte(), 0x00))
+        
+        Log.i(TAG, "Sending ${commands.size} commands to second characteristic")
+        
+        characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+        
+        var delay = 0L
+        for ((index, cmd) in commands.withIndex()) {
+            if (cmd.isEmpty()) continue
+            
+            bleHandler.postDelayed({
+                try {
+                    Log.d(TAG, "Second init ${index + 1}/${commands.size}: ${cmd.toHexString()}")
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        gatt.writeCharacteristic(characteristic, cmd, BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE)
+                    } else {
+                        @Suppress("DEPRECATION")
+                        characteristic.value = cmd
+                        @Suppress("DEPRECATION")
+                        gatt.writeCharacteristic(characteristic)
+                    }
+                } catch (e: SecurityException) {
+                    Log.e(TAG, "Second init command failed", e)
+                }
+            }, delay)
+            delay += 150L
+        }
+        
+        bleHandler.postDelayed({
+            Log.i(TAG, ">>> DUAL INIT COMPLETE - Tracking active!")
+            updateStatus(Status.TRACKING, "Tracking active (dual init)")
+        }, delay)
     }
     
     /**
@@ -550,7 +975,31 @@ class BleTrackingService : Service() {
         Log.i(TAG, ">>> BLE NOTIFICATION received! Char: ${charUuid.takeLast(8)}, Size: ${data.size}")
         
         if (data.size > 10) {
-            Log.d(TAG, "Raw data: ${data.take(40).toByteArray().toHexString()}")
+            // Log more bytes to see full packet structure
+            Log.d(TAG, "Raw data: ${data.toHexString()}")
+        }
+        
+        // Parse channel prefix from device ID confirm response
+        // Format: 00 01 [8-byte ID] 04 00 00 [prefix] 00 01
+        if (data.size >= 16 && data[0] == 0x00.toByte() && data[1] == 0x01.toByte()) {
+            // Check command byte at position 10
+            val cmdByte = data[10].toInt() and 0xFF
+            
+            if (cmdByte == 0x04 && data.size >= 14) {
+                // Device ID confirm response - extract channel prefix from byte 13
+                val newPrefix = data[13]
+                if (newPrefix != 0x00.toByte()) {
+                    channelPrefix = newPrefix
+                    Log.i(TAG, ">>> CHANNEL PREFIX: 0x${"%02x".format(newPrefix)} (${newPrefix.toInt() and 0xFF})")
+                }
+            } else if (cmdByte == 0x01 && data.size >= 14) {
+                // Channel 1 subscription response - extract assigned channel
+                val newChannel = data[13]
+                if (newChannel != 0x00.toByte()) {
+                    assignedChannel = newChannel
+                    Log.i(TAG, ">>> CHANNEL ASSIGNED: 0x${"%02x".format(newChannel)} (${newChannel.toInt() and 0xFF})")
+                }
+            }
         }
         
         val position = GarminProtocol.parseNotification(data)
@@ -724,6 +1173,11 @@ class BleTrackingService : Service() {
     }
     
     private fun Double.format(digits: Int) = "%.${digits}f".format(this)
+    
+    // Helper to convert hex string to ByteArray
+    private fun bytes(hex: String): ByteArray {
+        return hex.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+    }
     
     private fun ByteArray.toHexString() = joinToString("-") { "%02X".format(it) }
 }

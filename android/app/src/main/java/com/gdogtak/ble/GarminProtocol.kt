@@ -19,7 +19,8 @@ object GarminProtocol {
     const val SERVICE_UUID = "6a4e2800-667b-11e3-949a-0800200c9a66"
     
     // Write characteristic for init sequence commands
-    const val WRITE_CHAR_UUID = "6a4e2821-667b-11e3-949a-0800200c9a66"
+    const val WRITE_CHAR_UUID = "6a4e2823-667b-11e3-949a-0800200c9a66"  // Channel 3 - COLLAR DATA (handle 0x24)
+    const val WRITE_CHAR_UUID_2 = "6a4e2824-667b-11e3-949a-0800200c9a66"  // Channel 4 - also has collar data (handle 0x29)
     
     // All notification characteristics to subscribe to
     val NOTIFY_CHAR_UUIDS = listOf(
@@ -109,8 +110,18 @@ object GarminProtocol {
         // Search for 02 XX pattern (device type indicator)
         val searchLimit = minOf(data.size - 2, 30)
         for (i in 0 until searchLimit) {
-            if (data[i] == 0x02.toByte() && data[i + 1] == marker) {
-                return true
+            if (data[i] == 0x02.toByte()) {
+                val found = data[i + 1]
+                if (found == marker) {
+                    android.util.Log.d("GarminProtocol", "Found device marker 02 ${"%02x".format(marker)} at index $i")
+                    return true
+                }
+            }
+        }
+        // Log what we DID find for debugging
+        for (i in 0 until searchLimit) {
+            if (data[i] == 0x02.toByte()) {
+                android.util.Log.d("GarminProtocol", "Found 02 ${"%02x".format(data[i+1])} at index $i (looking for ${"%02x".format(marker)})")
             }
         }
         return false
