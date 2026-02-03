@@ -18,7 +18,11 @@
       "Bash(pip3 install:*)",
       "Bash(.adb shell \"find /data -name ''*btsnoop*'' -o -name ''*.cfa'' 2>/dev/null | head -20\")",
       "Bash(C:platform-toolsadb.exe shell \"find /data -name ''*btsnoop*'' -o -name ''*.cfa'' 2>/dev/null\")",
-      "Bash(ls \"C:\\\\PROJECTS\\\\GDOGTAK-WORKSPACE\\\\LOGS\\\\BUG-REPORTS\\\\BR_2026-02-02_01\\\\FS\\\\data\\\\misc\\\\bluetooth\\\\logs\"\" 2>/dev/null; ls \"C:PROJECTSGDOGTAK-WORKSPACELOGSBUG-REPORTSBR_2026-02-02_01FSdatamiscbluetooth\"\")"
+      "Bash(ls \"C:\\\\PROJECTS\\\\GDOGTAK-WORKSPACE\\\\LOGS\\\\BUG-REPORTS\\\\BR_2026-02-02_01\\\\FS\\\\data\\\\misc\\\\bluetooth\\\\logs\"\" 2>/dev/null; ls \"C:PROJECTSGDOGTAK-WORKSPACELOGSBUG-REPORTSBR_2026-02-02_01FSdatamiscbluetooth\"\")",
+      "Bash(.gradlew.bat assembleDebug:*)",
+      "Bash(cmd /c \"gradlew.bat assembleDebug 2>&1\")",
+      "Bash(cmd /c \"cd /d c:\\\\Users\\\\PNADMIN\\\\Documents\\\\GitHub\\\\GdogTAK\\\\android && gradlew.bat assembleDebug 2>&1\")",
+      "Bash(JAVA_HOME='C:\\\\Program Files\\\\Android\\\\Android Studio\\\\jbr' powershell -Command \"Set-Location ''c:\\\\Users\\\\PNADMIN\\\\Documents\\\\GitHub\\\\GdogTAK\\\\android''; $env:JAVA_HOME=''C:\\\\Program Files\\\\Android\\\\Android Studio\\\\jbr''; .\\\\gradlew.bat assembleDebug 2>&1 | Out-String\")"
     ]
   }
 }
