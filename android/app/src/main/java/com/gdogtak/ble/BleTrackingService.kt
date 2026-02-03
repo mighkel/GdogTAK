@@ -99,9 +99,14 @@ class BleTrackingService : Service() {
     // Dynamically assigned data channel from Alpha
     private var assignedChannel: Byte = 0x0f  // Default, will be updated from response
     private var channelPrefix: Byte = 0x2f  // Channel prefix from device, varies each session
-    
+
     // Device ID for init sequence (generated once per app install)
     private var deviceId: ByteArray? = null
+
+    // Periodic polling state - keeps collar relay alive after init
+    private var pollingRunnable: Runnable? = null
+    private var pollingTickCount = 0
+    private var collarSlotIndex = 0  // Cycles through 0x80-0x9E for re-registration
     
     // Binder for activity communication
     private val binder = LocalBinder()
@@ -211,7 +216,8 @@ class BleTrackingService : Service() {
      */
     private fun stopTracking() {
         Log.i(TAG, "Stopping tracking")
-        
+
+        stopPeriodicPolling()
         stopBleScan()
         disconnectGatt()
         atakBroadcaster.shutdown()
@@ -347,6 +353,7 @@ class BleTrackingService : Service() {
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
                     Log.i(TAG, "Disconnected from GATT server")
+                    stopPeriodicPolling()
                     updateStatus(Status.IDLE, "Disconnected")
                     // Try to reconnect
                     serviceScope.launch {
@@ -836,6 +843,7 @@ class BleTrackingService : Service() {
                     startSecondInit(gatt, writeChar2)
                 } else {
                     Log.w(TAG, "Second write characteristic not available, skipping")
+                    startPeriodicPolling(gatt, characteristic)
                     updateStatus(Status.TRACKING, "Tracking active (standalone)")
                 }
             }, delay)
@@ -934,11 +942,160 @@ class BleTrackingService : Service() {
         }
         
         bleHandler.postDelayed({
-            Log.i(TAG, ">>> DUAL INIT COMPLETE - Tracking active!")
-            updateStatus(Status.TRACKING, "Tracking active (dual init)")
+            Log.i(TAG, ">>> DUAL INIT COMPLETE - Starting periodic polling")
+            // Start periodic polling on char1 (the main data characteristic)
+            val mainChar = writeCharacteristic
+            if (mainChar != null) {
+                startPeriodicPolling(gatt, mainChar)
+            }
+            updateStatus(Status.TRACKING, "Tracking active (dual init + polling)")
         }, delay)
     }
     
+    /**
+     * Start periodic polling after init completes.
+     * The Alpha app continuously sends commands to keep the collar relay alive.
+     * Key commands: 02_08 (polling), 02_34 (position request), 02_11 (collar slot re-registration).
+     * Without these, the Alpha stops relaying collar positions after ~1 update.
+     */
+    private fun startPeriodicPolling(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
+        stopPeriodicPolling()
+        pollingTickCount = 0
+        collarSlotIndex = 0
+
+        val configPrefix = (channelPrefix + 2).toByte()
+
+        // Send an initial burst of 02_08 polling commands (Alpha sends 7 during init)
+        Log.i(TAG, "Sending initial 02_08 polling burst")
+        for (i in 0 until 5) {
+            bleHandler.postDelayed({
+                val cmd = buildPollingCommand(configPrefix)
+                sendCommand(gatt, characteristic, cmd, "Poll burst ${i + 1}")
+            }, (i * 200).toLong())
+        }
+
+        pollingRunnable = object : Runnable {
+            override fun run() {
+                val g = bluetoothGatt ?: return
+                pollingTickCount++
+                Log.d(TAG, "Periodic poll tick #$pollingTickCount")
+
+                try {
+                    // Every tick (5 seconds): re-register 3 collar slots
+                    for (j in 0 until 3) {
+                        val slot = 0x80 + collarSlotIndex
+                        if (slot <= 0x9E) {
+                            val slotCmd = GarminProtocol.buildCollarSlotPacket(
+                                slot, seqHi = 0x02, seqLo = (pollingTickCount * 3 + j) and 0xFF
+                            )
+                            val prefixed = ByteArray(2 + slotCmd.size)
+                            prefixed[0] = configPrefix
+                            prefixed[1] = 0x00
+                            System.arraycopy(slotCmd, 0, prefixed, 2, slotCmd.size)
+                            sendCommand(g, characteristic, prefixed, "Re-reg slot 0x${"%02x".format(slot)}")
+                        }
+                        collarSlotIndex = (collarSlotIndex + 1) % 31  // 0x80-0x9E = 31 slots
+                    }
+
+                    // Every 6th tick (~30 seconds): send 02_08 polling command
+                    if (pollingTickCount % 6 == 0) {
+                        val pollCmd = buildPollingCommand(configPrefix)
+                        sendCommand(g, characteristic, pollCmd, "Periodic poll 02_08")
+                    }
+
+                    // Every 12th tick (~60 seconds): send 02_34 position request
+                    if (pollingTickCount % 12 == 0) {
+                        val posReqCmd = buildPositionRequestCommand(configPrefix)
+                        sendCommand(g, characteristic, posReqCmd, "Periodic pos req 02_34")
+                    }
+
+                    // Every 24th tick (~2 minutes): send 02_37 GPS update
+                    if (pollingTickCount % 24 == 0) {
+                        val gpsCmd = buildGpsUpdateCommand(configPrefix)
+                        sendCommand(g, characteristic, gpsCmd, "Periodic GPS 02_37")
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Periodic polling error", e)
+                }
+
+                bleHandler.postDelayed(this, 5000)  // 5-second interval
+            }
+        }
+
+        // Start periodic polling 3 seconds after init burst
+        bleHandler.postDelayed(pollingRunnable!!, 3000)
+        Log.i(TAG, "Periodic polling started (5-second interval)")
+    }
+
+    private fun stopPeriodicPolling() {
+        pollingRunnable?.let {
+            bleHandler.removeCallbacks(it)
+            pollingRunnable = null
+        }
+    }
+
+    /** Build 02_08 polling command with channel prefix */
+    private fun buildPollingCommand(configPrefix: Byte): ByteArray {
+        // From BR5 capture: 02 08 04 1e [seq] [xx] 03 [checksum] 00
+        // Using a static version - Alpha accepts repeated commands
+        val body = byteArrayOf(
+            0x02, 0x08, 0x04, 0x1e,
+            0x83.toByte(), 0x08, 0x03,
+            0xf1.toByte(), 0x48, 0x00
+        )
+        val cmd = ByteArray(2 + body.size)
+        cmd[0] = configPrefix
+        cmd[1] = 0x00
+        System.arraycopy(body, 0, cmd, 2, body.size)
+        return cmd
+    }
+
+    /** Build 02_34 position request command with channel prefix */
+    private fun buildPositionRequestCommand(configPrefix: Byte): ByteArray {
+        // From BR5 capture: 57-byte position request
+        val body = byteArrayOf(
+            0x02, 0x34, 0x04, 0x2b,
+            0x80.toByte(), 0x13, 0x01, 0x01, 0x01, 0x01,
+            0x02, 0x20, 0x01, 0x01, 0x02, 0x20, 0x01, 0x01,
+            0x23, 0xfa.toByte(), 0x01, 0x1d, 0x1a, 0x1b, 0x12, 0x19,
+            0xaa.toByte(), 0x06, 0x16, 0x0a, 0x14, 0x22, 0x12,
+            0x09, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x18, 0x02, 0x20, 0x01,
+            0x10, 0x46, 0x71, 0x6f, 0x00
+        )
+        val cmd = ByteArray(2 + body.size)
+        cmd[0] = configPrefix
+        cmd[1] = 0x00
+        System.arraycopy(body, 0, cmd, 2, body.size)
+        return cmd
+    }
+
+    /** Build 02_37 GPS update command with channel prefix */
+    private fun buildGpsUpdateCommand(configPrefix: Byte): ByteArray {
+        // From BR5 capture: 60-byte GPS position update
+        // Reuse the same bytes from init (static coords for now)
+        val body = byteArrayOf(
+            0x02, 0x37, 0x04, 0x2b,
+            0x88.toByte(), 0x05,
+            0x01, 0x01, 0x01, 0x01,
+            0x02, 0x23, 0x01, 0x01, 0x02, 0x23, 0x01, 0x01,
+            0x14, 0x82.toByte(), 0x02, 0x20,
+            0x0a, 0x1e, 0x0a, 0x1a, 0x08, 0x01, 0x12, 0x12,
+            0x09,
+            0x12, 0x44, 0xd8.toByte(), 0x41, 0x83.toByte(), 0xb6.toByte(), 0x32, 0x12,
+            0x11,
+            0xdb.toByte(), 0xe5.toByte(), 0xa5.toByte(), 0xb7.toByte(), 0x52, 0x7b, 0x26, 0xb6.toByte(),
+            0x18, 0x02, 0x20, 0x01,
+            0x10, 0x46, 0x71, 0x6f, 0x00
+        )
+        val cmd = ByteArray(2 + body.size)
+        cmd[0] = configPrefix
+        cmd[1] = 0x00
+        System.arraycopy(body, 0, cmd, 2, body.size)
+        return cmd
+    }
+
     /**
      * Handle incoming BLE notification with position data
      */
