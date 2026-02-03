@@ -957,6 +957,10 @@ class BleTrackingService : Service() {
      * The Alpha app continuously sends commands to keep the collar relay alive.
      * Key commands: 02_08 (polling), 02_34 (position request), 02_11 (collar slot re-registration).
      * Without these, the Alpha stops relaying collar positions after ~1 update.
+     *
+     * IMPORTANT: Android BLE only allows ONE outstanding write at a time. Each writeCharacteristic
+     * call must wait for onCharacteristicWrite callback before the next. We use postDelayed with
+     * 200ms gaps (same as init sequence) to avoid write collisions.
      */
     private fun startPeriodicPolling(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
         stopPeriodicPolling()
@@ -964,56 +968,73 @@ class BleTrackingService : Service() {
         collarSlotIndex = 0
 
         val configPrefix = (channelPrefix + 2).toByte()
+        Log.i(TAG, "Polling configPrefix=0x${"%02x".format(configPrefix)} (channelPrefix=0x${"%02x".format(channelPrefix)})")
 
         // Send an initial burst of 02_08 polling commands (Alpha sends 7 during init)
-        Log.i(TAG, "Sending initial 02_08 polling burst")
+        // Use 250ms gaps to ensure each write completes before the next
+        Log.i(TAG, "Sending initial 02_08 polling burst (5 commands, 250ms apart)")
         for (i in 0 until 5) {
             bleHandler.postDelayed({
+                val g = bluetoothGatt
+                if (g == null) {
+                    Log.e(TAG, "Poll burst ${i + 1}: gatt is null!")
+                    return@postDelayed
+                }
                 val cmd = buildPollingCommand(configPrefix)
-                sendCommand(gatt, characteristic, cmd, "Poll burst ${i + 1}")
-            }, (i * 200).toLong())
+                Log.i(TAG, "Poll burst ${i + 1}/5: ${cmd.toHexString()}")
+                sendCommandLogged(g, characteristic, cmd, "Poll burst ${i + 1}")
+            }, (i * 250).toLong())
         }
 
         pollingRunnable = object : Runnable {
             override fun run() {
-                val g = bluetoothGatt ?: return
+                val g = bluetoothGatt
+                if (g == null) {
+                    Log.e(TAG, "Periodic poll: gatt is null, stopping polling")
+                    return
+                }
                 pollingTickCount++
-                Log.d(TAG, "Periodic poll tick #$pollingTickCount")
 
+                // Send ONE command per tick to avoid BLE write collisions.
+                // Rotate through: collar slot re-reg (most ticks), polling, position req, GPS
                 try {
-                    // Every tick (5 seconds): re-register 3 collar slots
-                    for (j in 0 until 3) {
-                        val slot = 0x80 + collarSlotIndex
-                        if (slot <= 0x9E) {
+                    val cmdToSend: ByteArray
+                    val cmdDesc: String
+
+                    when {
+                        // Every 24th tick (~2 minutes): GPS update
+                        pollingTickCount % 24 == 0 -> {
+                            cmdToSend = buildGpsUpdateCommand(configPrefix)
+                            cmdDesc = "GPS update 02_37"
+                        }
+                        // Every 12th tick (~1 minute): position request
+                        pollingTickCount % 12 == 0 -> {
+                            cmdToSend = buildPositionRequestCommand(configPrefix)
+                            cmdDesc = "Pos request 02_34"
+                        }
+                        // Every 6th tick (~30 seconds): polling config
+                        pollingTickCount % 6 == 0 -> {
+                            cmdToSend = buildPollingCommand(configPrefix)
+                            cmdDesc = "Poll config 02_08"
+                        }
+                        // All other ticks: collar slot re-registration
+                        else -> {
+                            val slot = 0x80 + collarSlotIndex
                             val slotCmd = GarminProtocol.buildCollarSlotPacket(
-                                slot, seqHi = 0x02, seqLo = (pollingTickCount * 3 + j) and 0xFF
+                                slot, seqHi = 0x02, seqLo = pollingTickCount and 0xFF
                             )
                             val prefixed = ByteArray(2 + slotCmd.size)
                             prefixed[0] = configPrefix
                             prefixed[1] = 0x00
                             System.arraycopy(slotCmd, 0, prefixed, 2, slotCmd.size)
-                            sendCommand(g, characteristic, prefixed, "Re-reg slot 0x${"%02x".format(slot)}")
+                            cmdToSend = prefixed
+                            cmdDesc = "Re-reg slot 0x${"%02x".format(slot)}"
+                            collarSlotIndex = (collarSlotIndex + 1) % 31
                         }
-                        collarSlotIndex = (collarSlotIndex + 1) % 31  // 0x80-0x9E = 31 slots
                     }
 
-                    // Every 6th tick (~30 seconds): send 02_08 polling command
-                    if (pollingTickCount % 6 == 0) {
-                        val pollCmd = buildPollingCommand(configPrefix)
-                        sendCommand(g, characteristic, pollCmd, "Periodic poll 02_08")
-                    }
-
-                    // Every 12th tick (~60 seconds): send 02_34 position request
-                    if (pollingTickCount % 12 == 0) {
-                        val posReqCmd = buildPositionRequestCommand(configPrefix)
-                        sendCommand(g, characteristic, posReqCmd, "Periodic pos req 02_34")
-                    }
-
-                    // Every 24th tick (~2 minutes): send 02_37 GPS update
-                    if (pollingTickCount % 24 == 0) {
-                        val gpsCmd = buildGpsUpdateCommand(configPrefix)
-                        sendCommand(g, characteristic, gpsCmd, "Periodic GPS 02_37")
-                    }
+                    Log.i(TAG, "Poll #$pollingTickCount: $cmdDesc (${cmdToSend.size}B) ${cmdToSend.copyOf(minOf(6, cmdToSend.size)).toHexString()}")
+                    sendCommandLogged(g, characteristic, cmdToSend, cmdDesc)
                 } catch (e: Exception) {
                     Log.e(TAG, "Periodic polling error", e)
                 }
@@ -1022,15 +1043,37 @@ class BleTrackingService : Service() {
             }
         }
 
-        // Start periodic polling 3 seconds after init burst
-        bleHandler.postDelayed(pollingRunnable!!, 3000)
-        Log.i(TAG, "Periodic polling started (5-second interval)")
+        // Start periodic polling 3 seconds after init burst completes
+        bleHandler.postDelayed(pollingRunnable!!, 3000 + 5 * 250)
+        Log.i(TAG, "Periodic polling scheduled (5-second interval, starts after burst)")
     }
 
     private fun stopPeriodicPolling() {
         pollingRunnable?.let {
             bleHandler.removeCallbacks(it)
             pollingRunnable = null
+            Log.i(TAG, "Periodic polling stopped")
+        }
+    }
+
+    /** Send a command and log the result at Log.i level */
+    private fun sendCommandLogged(gatt: BluetoothGatt, char: BluetoothGattCharacteristic, cmd: ByteArray, desc: String) {
+        try {
+            char.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                val result = gatt.writeCharacteristic(char, cmd, BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE)
+                Log.i(TAG, ">>> WRITE $desc: result=$result (0=OK)")
+            } else {
+                @Suppress("DEPRECATION")
+                char.value = cmd
+                @Suppress("DEPRECATION")
+                val result = gatt.writeCharacteristic(char)
+                Log.i(TAG, ">>> WRITE $desc: result=$result")
+            }
+        } catch (e: SecurityException) {
+            Log.e(TAG, ">>> WRITE $desc: SecurityException", e)
+        } catch (e: Exception) {
+            Log.e(TAG, ">>> WRITE $desc: Exception", e)
         }
     }
 
