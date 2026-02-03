@@ -107,6 +107,8 @@ class BleTrackingService : Service() {
     private var pollingRunnable: Runnable? = null
     private var pollingTickCount = 0
     private var collarSlotIndex = 0  // Cycles through 0x80-0x9E for re-registration
+    private var relaySeqHi: Byte = 0x80.toByte()  // Rolling sequence for 02_35 commands
+    private var relaySeqLo: Byte = 0xBF.toByte()  // Rolling counter for 02_35 commands
     
     // Binder for activity communication
     private val binder = LocalBinder()
@@ -948,15 +950,16 @@ class BleTrackingService : Service() {
             if (mainChar != null) {
                 startPeriodicPolling(gatt, mainChar)
             }
-            updateStatus(Status.TRACKING, "Tracking active (dual init + polling)")
+            updateStatus(Status.TRACKING, "Tracking active (dual init + 02_35 relay)")
         }, delay)
     }
     
     /**
      * Start periodic polling after init completes.
      * The Alpha app continuously sends commands to keep the collar relay alive.
-     * Key commands: 02_08 (polling), 02_34 (position request), 02_11 (collar slot re-registration).
+     * Key commands: 02_35 (collar relay), 02_08 (polling), 02_34 (position request), 02_11 (collar slot re-registration).
      * Without these, the Alpha stops relaying collar positions after ~1 update.
+     * The Alpha app sends 02_35 at ~3/sec (391x in a working session) - this is the most critical.
      *
      * IMPORTANT: Android BLE only allows ONE outstanding write at a time. Each writeCharacteristic
      * call must wait for onCharacteristicWrite callback before the next. We use postDelayed with
@@ -996,29 +999,30 @@ class BleTrackingService : Service() {
                 pollingTickCount++
 
                 // Send ONE command per tick to avoid BLE write collisions.
-                // Rotate through: collar slot re-reg (most ticks), polling, position req, GPS
+                // 02_35 (collar relay) is the most frequent - sent on most ticks.
+                // Alpha sends it ~3/sec (391x in working session) vs 02_11 (~10/sec).
                 try {
                     val cmdToSend: ByteArray
                     val cmdDesc: String
 
                     when {
-                        // Every 24th tick (~2 minutes): GPS update
-                        pollingTickCount % 24 == 0 -> {
+                        // Every 30th tick (~1 minute): GPS update
+                        pollingTickCount % 30 == 0 -> {
                             cmdToSend = buildGpsUpdateCommand(configPrefix)
                             cmdDesc = "GPS update 02_37"
                         }
-                        // Every 12th tick (~1 minute): position request
-                        pollingTickCount % 12 == 0 -> {
+                        // Every 15th tick (~30 seconds): position request
+                        pollingTickCount % 15 == 0 -> {
                             cmdToSend = buildPositionRequestCommand(configPrefix)
                             cmdDesc = "Pos request 02_34"
                         }
-                        // Every 6th tick (~30 seconds): polling config
-                        pollingTickCount % 6 == 0 -> {
+                        // Every 10th tick (~20 seconds): polling config
+                        pollingTickCount % 10 == 0 -> {
                             cmdToSend = buildPollingCommand(configPrefix)
                             cmdDesc = "Poll config 02_08"
                         }
-                        // All other ticks: collar slot re-registration
-                        else -> {
+                        // Every 5th tick (~10 seconds): collar slot re-registration
+                        pollingTickCount % 5 == 0 -> {
                             val slot = 0x80 + collarSlotIndex
                             val slotCmd = GarminProtocol.buildCollarSlotPacket(
                                 slot, seqHi = 0x02, seqLo = pollingTickCount and 0xFF
@@ -1031,6 +1035,11 @@ class BleTrackingService : Service() {
                             cmdDesc = "Re-reg slot 0x${"%02x".format(slot)}"
                             collarSlotIndex = (collarSlotIndex + 1) % 31
                         }
+                        // All other ticks: collar relay 02_35 (the critical missing command)
+                        else -> {
+                            cmdToSend = buildCollarRelayCommand(configPrefix)
+                            cmdDesc = "Collar relay 02_35"
+                        }
                     }
 
                     Log.i(TAG, "Poll #$pollingTickCount: $cmdDesc (${cmdToSend.size}B) ${cmdToSend.copyOf(minOf(6, cmdToSend.size)).toHexString()}")
@@ -1039,13 +1048,13 @@ class BleTrackingService : Service() {
                     Log.e(TAG, "Periodic polling error", e)
                 }
 
-                bleHandler.postDelayed(this, 5000)  // 5-second interval
+                bleHandler.postDelayed(this, 2000)  // 2-second interval (Alpha sends at ~0.3s)
             }
         }
 
         // Start periodic polling 3 seconds after init burst completes
         bleHandler.postDelayed(pollingRunnable!!, 3000 + 5 * 250)
-        Log.i(TAG, "Periodic polling scheduled (5-second interval, starts after burst)")
+        Log.i(TAG, "Periodic polling scheduled (2-second interval with 02_35 relay, starts after burst)")
     }
 
     private fun stopPeriodicPolling() {
@@ -1132,6 +1141,45 @@ class BleTrackingService : Service() {
             0x18, 0x02, 0x20, 0x01,
             0x10, 0x46, 0x71, 0x6f, 0x00
         )
+        val cmd = ByteArray(2 + body.size)
+        cmd[0] = configPrefix
+        cmd[1] = 0x00
+        System.arraycopy(body, 0, cmd, 2, body.size)
+        return cmd
+    }
+
+    /**
+     * Build 02_35 collar relay command with channel prefix.
+     * This is the most critical periodic command - Alpha sends it ~3/sec (391x in a working session).
+     * The command contains collar subscription data with a rolling sequence counter.
+     * From BR5 capture: 58-byte command (56 body + 2-byte channel prefix).
+     */
+    private fun buildCollarRelayCommand(configPrefix: Byte): ByteArray {
+        // Body from BR5 capture - the bulk 02_35 pattern (05 2c variant, 389 of 391 instances)
+        // Bytes 5-6 are rolling counters that we increment each call
+        val body = byteArrayOf(
+            0x00, 0x02, 0x35, 0x05, 0x2c,
+            relaySeqHi, relaySeqLo,
+            0x0f, 0x01, 0x01, 0x01,
+            0x02, 0x21, 0x01, 0x01, 0x02, 0x21, 0x01, 0x01,
+            0x0f, 0xb2.toByte(), 0x01, 0x1e, 0xea.toByte(), 0x01, 0x1b,
+            0x0a, 0x19, 0x0a, 0x10,
+            // Collar device ID (from BR5 capture - matches the tracked collar)
+            0x33, 0x91.toByte(), 0x77, 0xcd.toByte(), 0x01, 0x01, 0x02, 0x80.toByte(),
+            0x02, 0x10, 0x01, 0x03, 0x4b, 0x01, 0x01,
+            0x0a, 0x10, 0x20,
+            // Timestamp varint (incrementing) and trailing bytes
+            0x18, 0x84.toByte(), 0x01, 0x28, 0x75,
+            0xb5.toByte(), 0x1b, 0x00
+        )
+        // Increment rolling sequence counters (mimic Alpha's cycling pattern)
+        relaySeqLo++
+        if (relaySeqLo == 0x00.toByte()) {
+            // Cycle seqHi through 0x80-0x9F range (32 values, matching Alpha pattern)
+            val hi = (relaySeqHi.toInt() and 0xFF)
+            relaySeqHi = if (hi >= 0x9F) 0x80.toByte() else (hi + 1).toByte()
+        }
+
         val cmd = ByteArray(2 + body.size)
         cmd[0] = configPrefix
         cmd[1] = 0x00
