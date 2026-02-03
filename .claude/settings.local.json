@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(\"C:\\\\Program Files\\\\Wireshark\\\\tshark.exe\" -r \"C:\\\\PROJECTS\\\\GDOGTAK-WORKSPACE\\\\LOGS\\\\ARCHIVED\\\\hci_snoop20251208150648.cfa\" -Y \"btatt.opcode == 0x52\" -T fields -e btatt.handle -e btatt.value)",
+      "Bash(findstr:*)",
+      "Bash(\"C:\\\\Program Files\\\\Wireshark\\\\tshark.exe\" -r \"C:\\\\PROJECTS\\\\GDOGTAK-WORKSPACE\\\\LOGS\\\\ARCHIVED\\\\hci_snoop20251208150648.cfa\" -Y \"btatt.opcode == 0x52 && btatt.handle == 0x0024\" -T fields -e btatt.value)",
+      "Bash(powershell:*)",
+      "Bash(python:*)",
+      "Bash(cmd /c \"type C:\\\\Users\\\\PNADMIN\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-PNADMIN-Documents-GitHub-GdogTAK\\\\tasks\\\\b602400.output\")",
+      "Bash(\"C:\\\\Program Files\\\\Wireshark\\\\tshark.exe\" -r \"C:\\\\PROJECTS\\\\GDOGTAK-WORKSPACE\\\\LOGS\\\\ARCHIVED\\\\hci_snoop20251208150648.cfa\" -Y \"btatt.opcode == 0x52 && btatt.handle == 0x0024\" -T fields -e btatt.opcode -e btatt.handle -e btatt.value -c 5)",
+      "Bash(\"C:\\\\Program Files\\\\Wireshark\\\\tshark.exe\" -r \"C:\\\\PROJECTS\\\\GDOGTAK-WORKSPACE\\\\LOGS\\\\ARCHIVED\\\\hci_snoop20251208150648.cfa\" -Y \"btatt.opcode == 0x52 and btatt.handle == 0x0024\" -T fields -e btatt.opcode -e btatt.handle -e btatt.value -c 5)",
+      "Bash(\"C:\\\\Program Files\\\\Wireshark\\\\tshark.exe\" -r \"C:\\\\PROJECTS\\\\GDOGTAK-WORKSPACE\\\\LOGS\\\\ARCHIVED\\\\hci_snoop20251208150648.cfa\" -Y \"btatt.opcode == 0x52\" -T fields -e btatt.handle -e btatt.value -c 10)",
+      "Bash(\"C:\\\\Program Files\\\\Wireshark\\\\tshark.exe\" -r \"C:\\\\PROJECTS\\\\GDOGTAK-WORKSPACE\\\\LOGS\\\\ARCHIVED\\\\hci_snoop20251208150648.cfa\" -c 10 -T fields -e frame.number -e btatt.opcode -e btatt.handle -e data)",
+      "Bash(\"C:\\\\Program Files\\\\Wireshark\\\\tshark.exe\" -r \"C:\\\\PROJECTS\\\\GDOGTAK-WORKSPACE\\\\LOGS\\\\ARCHIVED\\\\hci_snoop20251208150648.cfa\" -T fields -e frame.number -e btatt.value -c 50)",
+      "Bash(\"C:\\\\Program Files\\\\Wireshark\\\\tshark.exe\" -r \"C:\\\\PROJECTS\\\\GDOGTAK-WORKSPACE\\\\LOGS\\\\ARCHIVED\\\\hci_snoop20251208150648.cfa\" -Y btatt -T fields -e frame.number -e btatt.opcode -e btatt.value -c 10)",
+      "Bash(\"C:\\\\Program Files\\\\Wireshark\\\\tshark.exe\" -r \"C:\\\\PROJECTS\\\\GDOGTAK-WORKSPACE\\\\LOGS\\\\ARCHIVED\\\\hci_snoop20251208150648.cfa\" -T psml -c 20)",
+      "Bash(pip install:*)",
+      "Bash(pip3 install:*)",
+      "Bash(.adb shell \"find /data -name ''*btsnoop*'' -o -name ''*.cfa'' 2>/dev/null | head -20\")",
+      "Bash(C:platform-toolsadb.exe shell \"find /data -name ''*btsnoop*'' -o -name ''*.cfa'' 2>/dev/null\")",
+      "Bash(ls \"C:\\\\PROJECTS\\\\GDOGTAK-WORKSPACE\\\\LOGS\\\\BUG-REPORTS\\\\BR_2026-02-02_01\\\\FS\\\\data\\\\misc\\\\bluetooth\\\\logs\"\" 2>/dev/null; ls \"C:PROJECTSGDOGTAK-WORKSPACELOGSBUG-REPORTSBR_2026-02-02_01FSdatamiscbluetooth\"\")"
+    ]
+  }
+}

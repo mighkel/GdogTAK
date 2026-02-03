@@ -223,28 +223,46 @@ class BleTrackingService : Service() {
     }
     
     /**
-     * Start BLE scan for Garmin Alpha devices
-     * Uses device name filtering since Alpha may not advertise service UUID
+     * Try to connect to a bonded Alpha device first, then fall back to BLE scan.
+     * Bonded devices often don't advertise, so scanning alone won't find them.
      */
     private fun startBleScan() {
         if (isScanning) return
-        
+
         if (!hasBluetoothPermissions()) {
             updateStatus(Status.ERROR, "Missing Bluetooth permissions")
             return
         }
-        
+
+        // First, check if we already have a bonded Alpha device
         try {
-            // Scan without filters - we'll filter by device name in the callback
-            // The Alpha doesn't reliably advertise its service UUID
+            val bondedDevices = bluetoothAdapter?.bondedDevices ?: emptySet()
+            Log.i(TAG, "Checking ${bondedDevices.size} bonded devices for Alpha...")
+            for (device in bondedDevices) {
+                val name = try { device.name } catch (e: SecurityException) { null }
+                Log.d(TAG, "  Bonded: ${name ?: "unknown"} (${device.address})")
+                if (name != null && name.contains("Alpha", ignoreCase = true)) {
+                    Log.i(TAG, "Found bonded Alpha: $name (${device.address}) - connecting directly")
+                    updateStatus(Status.CONNECTING, "Connecting to bonded $name...")
+                    connectToDevice(device)
+                    return
+                }
+            }
+            Log.i(TAG, "No bonded Alpha found, falling back to BLE scan")
+        } catch (e: SecurityException) {
+            Log.w(TAG, "Cannot check bonded devices: ${e.message}")
+        }
+
+        // Fall back to BLE scan
+        try {
             val scanSettings = ScanSettings.Builder()
                 .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
                 .build()
-            
+
             bleScanner?.startScan(null, scanSettings, scanCallback)
             isScanning = true
             updateStatus(Status.SCANNING, "Scanning for Alpha...")
-            
+
             Log.i(TAG, "BLE scan started (name-based filtering)")
         } catch (e: SecurityException) {
             updateStatus(Status.ERROR, "Bluetooth permission denied")
@@ -701,73 +719,13 @@ class BleTrackingService : Service() {
             // Note: Collar slot registrations (02 11) will be added dynamically below
         )
         
-        // Hardcoded collar slot registrations from Dec 8 working session
-        // These have correct checksums - one per slot 80-9f
-        val collarSlotCommands = listOf(
-            // Slot 80
-            bytes("0211010480b41302180101010101010361b000"),
-            // Slot 81
-            bytes("0211010481b4130219010101010101035dbf00"),
-            // Slot 82
-            bytes("0211010482b41301010101010101010398dd00"),
-            // Slot 83
-            bytes("0211010483b413021b0101010101010325a100"),
-            // Slot 84
-            bytes("0211010484b413023401010101010103923200"),
-            // Slot 85 - CRITICAL: This is the collar slot from Dec 8!
-            bytes("0211010485b413020101010101010103acda00"),
-            // Slot 86
-            bytes("0211010486b413020201010101010103e8cb00"),
-            // Slot 87
-            bytes("0211010487b413020301010101010103d4c400"),
-            // Slot 88
-            bytes("0211010488b413020401010101010103813600"),
-            // Slot 89
-            bytes("0211010489b413020501010101010103bd3900"),
-            // Slot 8a
-            bytes("021101048ab41302070101010101010338e400"),
-            // Slot 8b
-            bytes("021101048bb41302060101010101010304eb00"),
-            // Slot 8c
-            bytes("021101048cb41302080101010101010370ac00"),
-            // Slot 8d
-            bytes("021101048db4130209010101010101034ca300"),
-            // Slot 8e
-            bytes("021101048eb413020a0101010101010308b200"),
-            // Slot 8f
-            bytes("021101048fb413020b0101010101010334bd00"),
-            // Slot 90
-            bytes("0211010490b413020c01010101010103a0b000"),
-            // Slot 91
-            bytes("0211010491b413020d010101010101039cbf00"),
-            // Slot 92
-            bytes("0211010492b413021f01010101010103186e00"),
-            // Slot 93
-            bytes("0211010493b413020e01010101010103256d00"),
-            // Slot 94
-            bytes("0211010494b413022001010101010103533200"),
-            // Slot 95
-            bytes("0211010495b413020f01010101010103eca900"),
-            // Slot 96
-            bytes("0211010496b413021001010101010103a9e100"),
-            // Slot 97
-            bytes("0211010497b41302110101010101010395ee00"),
-            // Slot 98
-            bytes("0211010498b413021201010101010103c1ef00"),
-            // Slot 99
-            bytes("0211010499b413021301010101010103fde000"),
-            // Slot 9a
-            bytes("021101049ab413021401010101010103b80200"),
-            // Slot 9b
-            bytes("021101049bb413021501010101010103840d00"),
-            // Slot 9c
-            bytes("021101049cb41302160101010101010331d300"),
-            // Slot 9d
-            bytes("021101049db4130223010101010101030f3b00"),
-            // Slot 9e
-            bytes("021101049eb41302170101010101010309d800")
-        )
-        Log.d(TAG, "Using ${collarSlotCommands.size} hardcoded collar slot registrations from Dec 8")
+        // Dynamically generate collar slot registrations (02 11) for slots 0x80-0x9F
+        // with computed checksums (reverse-engineered from Dec 8 btsnoop capture)
+        val collarSlotCommands = (0x80..0x9E).mapIndexed { index, slot ->
+            val seqLo = index + 1
+            GarminProtocol.buildCollarSlotPacket(slot, seqHi = 0x02, seqLo = seqLo)
+        }
+        Log.d(TAG, "Generated ${collarSlotCommands.size} collar slot registrations with computed checksums")
         
         // Combine base config + collar slots + remaining commands
         val remainingCommands = listOf(

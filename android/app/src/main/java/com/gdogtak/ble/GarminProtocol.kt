@@ -234,4 +234,64 @@ object GarminProtocol {
     private fun semicirclesToDegrees(semicircles: Long): Double {
         return semicircles * (180.0 / 2147483648.0)
     }
+
+    /**
+     * Compute the 2-byte checksum for a 02 11 collar slot registration command.
+     *
+     * Reverse-engineered from 175 known-good packets in the Dec 8, 2024 btsnoop
+     * capture via GF(2) linear algebra. The checksum is a base constant XOR'd
+     * with bit-position-specific masks depending on the message content.
+     *
+     * @param msg The 16-byte message body (02 11 ... 03), NOT including the
+     *            checksum or trailing 00 terminator.
+     * @return The 2-byte checksum as an Int (big-endian: high byte << 8 | low byte)
+     */
+    fun computeCollarSlotChecksum(msg: ByteArray): Int {
+        require(msg.size == 16) { "02 11 message must be exactly 16 bytes, got ${msg.size}" }
+        var chk = 0x83C2
+        // Byte 4: slot (bits 4..0)
+        if (msg[4].toInt() and 0x10 != 0) chk = chk xor 0xC1FF
+        if (msg[4].toInt() and 0x08 != 0) chk = chk xor 0xE1DF
+        if (msg[4].toInt() and 0x04 != 0) chk = chk xor 0xF1CF
+        if (msg[4].toInt() and 0x02 != 0) chk = chk xor 0xF9C7
+        if (msg[4].toInt() and 0x01 != 0) chk = chk xor 0xFDC3
+        // Byte 5: b4/b3 flag (bit 2)
+        if (msg[5].toInt() and 0x04 != 0) chk = chk xor 0x2114
+        // Byte 7: seq high (bit 1)
+        if (msg[7].toInt() and 0x02 != 0) chk = chk xor 0xC1CC
+        // Byte 8: seq low (bits 6..0)
+        if (msg[8].toInt() and 0x40 != 0) chk = chk xor 0x0430
+        if (msg[8].toInt() and 0x20 != 0) chk = chk xor 0x0218
+        if (msg[8].toInt() and 0x10 != 0) chk = chk xor 0x010C
+        if (msg[8].toInt() and 0x08 != 0) chk = chk xor 0x01A6
+        if (msg[8].toInt() and 0x04 != 0) chk = chk xor 0x01F3
+        if (msg[8].toInt() and 0x02 != 0) chk = chk xor 0x81D9
+        if (msg[8].toInt() and 0x01 != 0) chk = chk xor 0xC1CC
+        // Byte 15: trailing marker (bit 1)
+        if (msg[15].toInt() and 0x02 != 0) chk = chk xor 0x0200
+        return chk and 0xFFFF
+    }
+
+    /**
+     * Build a complete 02 11 collar slot registration packet with computed checksum.
+     *
+     * @param slot Collar slot number (0x80..0x9F)
+     * @param seqHi Sequence counter high byte
+     * @param seqLo Sequence counter low byte
+     * @param b4Flag true for 0xB4 variant (seqHi typically 02), false for 0xB3 (seqHi typically 03)
+     * @return Complete packet bytes including checksum and trailing 0x00
+     */
+    fun buildCollarSlotPacket(slot: Int, seqHi: Int, seqLo: Int, b4Flag: Boolean = true): ByteArray {
+        val flagByte = if (b4Flag) 0xB4.toByte() else 0xB3.toByte()
+        val midByte: Byte = if (b4Flag) 0x01 else 0x03
+        val msg = byteArrayOf(
+            0x02, 0x11, 0x01, 0x04,
+            slot.toByte(),
+            flagByte, 0x13,
+            seqHi.toByte(), seqLo.toByte(),
+            midByte, 0x01, 0x01, 0x01, 0x01, 0x01, 0x03
+        )
+        val chk = computeCollarSlotChecksum(msg)
+        return msg + byteArrayOf((chk shr 8).toByte(), (chk and 0xFF).toByte(), 0x00)
+    }
 }
