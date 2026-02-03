@@ -65,17 +65,17 @@ object GarminProtocol {
         val isCollar = isCollarMessage(data)
         val isHandheld = isHandheldMessage(data)
         
-        android.util.Log.d("GarminProtocol", "Device type: collar=$isCollar, handheld=$isHandheld")
-        
+        android.util.Log.i("GarminProtocol", "Device type: collar=$isCollar, handheld=$isHandheld")
+
         if (!isCollar && !isHandheld) {
-            android.util.Log.d("GarminProtocol", "No device marker found (02 35 or 02 28)")
+            android.util.Log.i("GarminProtocol", "No device marker found (02 35 or 02 28)")
             return null
         }
-        
+
         // Find and decode coordinates
         val coords = findCoordinates(data)
         if (coords == null) {
-            android.util.Log.d("GarminProtocol", "No coordinates found in packet")
+            android.util.Log.i("GarminProtocol", "No coordinates found in packet")
             return null
         }
         

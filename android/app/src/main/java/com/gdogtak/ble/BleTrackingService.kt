@@ -933,8 +933,8 @@ class BleTrackingService : Service() {
         Log.i(TAG, ">>> BLE NOTIFICATION received! Char: ${charUuid.takeLast(8)}, Size: ${data.size}")
         
         if (data.size > 10) {
-            // Log more bytes to see full packet structure
-            Log.d(TAG, "Raw data: ${data.toHexString()}")
+            // Log raw hex for position packet debugging
+            Log.i(TAG, "Raw data: ${data.toHexString()}")
         }
         
         // Parse channel prefix from device ID confirm response
@@ -963,7 +963,7 @@ class BleTrackingService : Service() {
         val position = GarminProtocol.parseNotification(data)
         
         if (position == null) {
-            Log.d(TAG, "Parse result: null (no valid position found)")
+            Log.i(TAG, "Parse result: null (no valid position found)")
             return
         }
         
