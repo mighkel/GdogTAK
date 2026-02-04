@@ -19,7 +19,8 @@ data class TrackedDevice(
     val longitude: Double,
     val lastUpdateTime: Long,  // System.currentTimeMillis()
     val bearing: Double?,      // Bearing from handheld, null if this IS the handheld
-    val distanceMeters: Double? // Distance from handheld, null if this IS the handheld
+    val distanceMeters: Double?, // Distance from handheld, null if this IS the handheld
+    val deviceType: String = if (isCollar) "collar" else "handheld" // collar, handheld, contact
 )
 
 /**
@@ -49,8 +50,12 @@ class TrackedDeviceAdapter(
     override fun onBindViewHolder(holder: ViewHolder, position: Int) {
         val device = getItem(position)
 
-        // Icon: dog for collar, radio for handheld
-        holder.icon.text = if (device.isCollar) "\uD83D\uDC15" else "\uD83D\uDCF1"
+        // Icon: dog for collar, radio for handheld, antenna for contact
+        holder.icon.text = when (device.deviceType) {
+            "collar" -> "\uD83D\uDC15"   // dog
+            "contact" -> "\uD83D\uDCE1"  // satellite antenna
+            else -> "\uD83D\uDCF1"       // phone (handheld)
+        }
 
         holder.label.text = device.label
         holder.position.text = "%.4f, %.4f".format(device.latitude, device.longitude)

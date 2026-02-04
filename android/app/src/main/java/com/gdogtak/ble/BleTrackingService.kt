@@ -88,9 +88,14 @@ class BleTrackingService : Service() {
     // Dog configuration - loaded from SharedPreferences
     private lateinit var dogConfig: CotGenerator.DogConfig
 
-    // Tracked device positions (handheld + collars)
+    // Tracked device positions (handheld + collars + contacts)
     private var handheldPosition: GarminProtocol.DogPosition? = null
-    
+    private var contactPosition: GarminProtocol.DogPosition? = null
+
+    // Dynamic collar device IDs from 229-byte device registry (command 07_16)
+    private var registeredCollars: List<GarminProtocol.CollarRegistryEntry> = emptyList()
+    private var registryParsed = false
+
     // Tracking stats
     private var positionCount = 0
     private var lastPosition: GarminProtocol.DogPosition? = null
@@ -1258,30 +1263,41 @@ class BleTrackingService : Service() {
      * Build 02_35 collar relay command with channel prefix.
      * This is the most critical periodic command - Alpha sends it ~3/sec (391x in a working session).
      * The command contains collar subscription data with a rolling sequence counter.
-     * From BR5 capture: 58-byte command (56 body + 2-byte channel prefix).
+     * Uses dynamically discovered collar device IDs from the 229-byte device registry.
+     * Falls back to hardcoded Shadow ID if no registry data available.
      */
     private fun buildCollarRelayCommand(configPrefix: Byte): ByteArray {
-        // Body from BR5 capture - the bulk 02_35 pattern (05 2c variant, 389 of 391 instances)
+        // Get the collar device ID - use dynamic registry or fallback to hardcoded
+        val collarId: ByteArray = if (registeredCollars.isNotEmpty()) {
+            registeredCollars[0].fullEntry  // Use first registered collar's full 16-byte entry
+        } else {
+            // Fallback: hardcoded Shadow collar entry from BR5 capture
+            byteArrayOf(
+                0x33, 0x91.toByte(), 0x77, 0xcd.toByte(), 0x01, 0x01, 0x02, 0x80.toByte(),
+                0x02, 0x10, 0x01, 0x03, 0x4b, 0x01, 0x01, 0x0f
+            )
+        }
+
+        // Body from BR5 capture - the bulk 02_35 pattern (05 2c variant)
         // Bytes 5-6 are rolling counters that we increment each call
-        val body = byteArrayOf(
+        val header = byteArrayOf(
             0x00, 0x02, 0x35, 0x05, 0x2c,
             relaySeqHi, relaySeqLo,
             0x0f, 0x01, 0x01, 0x01,
             0x02, 0x21, 0x01, 0x01, 0x02, 0x21, 0x01, 0x01,
             0x0f, 0xb2.toByte(), 0x01, 0x1e, 0xea.toByte(), 0x01, 0x1b,
-            0x0a, 0x19, 0x0a, 0x10,
-            // Collar device ID (from BR5 capture - matches the tracked collar)
-            0x33, 0x91.toByte(), 0x77, 0xcd.toByte(), 0x01, 0x01, 0x02, 0x80.toByte(),
-            0x02, 0x10, 0x01, 0x03, 0x4b, 0x01, 0x01,
+            0x0a, 0x19, 0x0a, 0x10
+        )
+        val trailer = byteArrayOf(
             0x0a, 0x10, 0x20,
-            // Timestamp varint (incrementing) and trailing bytes
             0x18, 0x84.toByte(), 0x01, 0x28, 0x75,
             0xb5.toByte(), 0x1b, 0x00
         )
+        val body = header + collarId + trailer
+
         // Increment rolling sequence counters (mimic Alpha's cycling pattern)
         relaySeqLo++
         if (relaySeqLo == 0x00.toByte()) {
-            // Cycle seqHi through 0x80-0x9F range (32 values, matching Alpha pattern)
             val hi = (relaySeqHi.toInt() and 0xFF)
             relaySeqHi = if (hi >= 0x9F) 0x80.toByte() else (hi + 1).toByte()
         }
@@ -1328,52 +1344,77 @@ class BleTrackingService : Service() {
             }
         }
         
+        // Check for device registry notification (229-byte 07_16 packet)
+        if (GarminProtocol.isDeviceRegistryPacket(data)) {
+            val entries = GarminProtocol.parseDeviceRegistry(data)
+            if (entries.isNotEmpty() && !registryParsed) {
+                registeredCollars = entries
+                registryParsed = true
+                Log.i(TAG, ">>> DEVICE REGISTRY: ${entries.size} collar(s) discovered:")
+                for (entry in entries) {
+                    Log.i(TAG, "    Collar ID: ${entry.deviceIdHex()}")
+                }
+            }
+            // Registry packets don't contain position data, skip further parsing
+            return
+        }
+
         val position = GarminProtocol.parseNotification(data)
-        
+
         if (position == null) {
             Log.i(TAG, "Parse result: null (no valid position found)")
             return
         }
-        
-        Log.i(TAG, ">>> PARSED: isCollar=${position.isCollar}, lat=${position.latitude}, lon=${position.longitude}")
-        
-        if (position.isCollar) {
-            positionCount++
-            lastPosition = position
 
-            Log.i(TAG, ">>> DOG POSITION #$positionCount: ${position.latitude}, ${position.longitude}")
+        Log.i(TAG, ">>> PARSED: type=${position.deviceType}, lat=${position.latitude}, lon=${position.longitude}")
 
-            // Generate and send CoT
-            val cot = CotGenerator.generateCot(position, dogConfig)
-            Log.d(TAG, ">>> Generated CoT for ${dogConfig.callsign}")
+        when (position.deviceType) {
+            GarminProtocol.DeviceType.COLLAR -> {
+                positionCount++
+                lastPosition = position
 
-            serviceScope.launch {
-                val sent = atakBroadcaster.sendCot(cot)
-                Log.i(TAG, ">>> CoT SENT: $sent")
+                Log.i(TAG, ">>> DOG POSITION #$positionCount: ${position.latitude}, ${position.longitude}")
 
-                if (sent) {
-                    updateStatus(
-                        Status.TRACKING,
-                        "Tracking: $positionCount positions",
-                        position.latitude,
-                        position.longitude
-                    )
-                } else {
-                    Log.e(TAG, ">>> CoT send FAILED!")
+                // Generate and send CoT
+                val cot = CotGenerator.generateCot(position, dogConfig)
+                Log.d(TAG, ">>> Generated CoT for ${dogConfig.callsign}")
+
+                serviceScope.launch {
+                    val sent = atakBroadcaster.sendCot(cot)
+                    Log.i(TAG, ">>> CoT SENT: $sent")
+
+                    if (sent) {
+                        updateStatus(
+                            Status.TRACKING,
+                            "Tracking: $positionCount positions",
+                            position.latitude,
+                            position.longitude
+                        )
+                    } else {
+                        Log.e(TAG, ">>> CoT send FAILED!")
+                    }
                 }
+
+                // Update notification
+                updateNotification("Tracking: ${position.latitude.format(5)}, ${position.longitude.format(5)}")
+
+                // Broadcast device list update
+                broadcastDeviceList()
             }
 
-            // Update notification
-            updateNotification("Tracking: ${position.latitude.format(5)}, ${position.longitude.format(5)}")
+            GarminProtocol.DeviceType.CONTACT -> {
+                contactPosition = position
+                Log.i(TAG, ">>> CONTACT position: ${position.latitude}, ${position.longitude}")
+                // Broadcast device list update with contact info
+                broadcastDeviceList()
+            }
 
-            // Broadcast device list update
-            broadcastDeviceList(position)
-        } else {
-            // Track handheld position for bearing/distance calculations
-            handheldPosition = position
-            Log.d(TAG, "Handheld position: ${position.latitude}, ${position.longitude}")
-            // Also broadcast device list when handheld updates
-            lastPosition?.let { broadcastDeviceList(it) }
+            GarminProtocol.DeviceType.HANDHELD -> {
+                handheldPosition = position
+                Log.d(TAG, "Handheld position: ${position.latitude}, ${position.longitude}")
+                // Broadcast device list when handheld updates
+                broadcastDeviceList()
+            }
         }
     }
     
@@ -1411,50 +1452,72 @@ class BleTrackingService : Service() {
      */
     /**
      * Broadcast the tracked device list to the UI.
-     * Currently tracks one collar and optionally the handheld.
+     * Tracks: handheld (reference), collar(s), and contact(s).
      */
-    private fun broadcastDeviceList(collarPosition: GarminProtocol.DogPosition) {
+    private fun broadcastDeviceList() {
         val intent = Intent(BROADCAST_DEVICES)
         var idx = 0
+        val hh = handheldPosition
 
         // Handheld device (reference point)
-        val hh = handheldPosition
         if (hh != null) {
             intent.putExtra("device_${idx}_id", "handheld")
             intent.putExtra("device_${idx}_label", "Alpha 300")
             intent.putExtra("device_${idx}_collar", false)
             intent.putExtra("device_${idx}_lat", hh.latitude)
             intent.putExtra("device_${idx}_lon", hh.longitude)
-            intent.putExtra("device_${idx}_time", System.currentTimeMillis())
+            intent.putExtra("device_${idx}_time", hh.timestamp)
             intent.putExtra("device_${idx}_bearing", Double.NaN)
             intent.putExtra("device_${idx}_distance", Double.NaN)
+            intent.putExtra("device_${idx}_type", "handheld")
             idx++
         }
 
-        // Collar device
-        intent.putExtra("device_${idx}_id", dogConfig.uid)
-        intent.putExtra("device_${idx}_label", dogConfig.callsign)
-        intent.putExtra("device_${idx}_collar", true)
-        intent.putExtra("device_${idx}_lat", collarPosition.latitude)
-        intent.putExtra("device_${idx}_lon", collarPosition.longitude)
-        intent.putExtra("device_${idx}_time", System.currentTimeMillis())
+        // Collar device (if we have a position)
+        val collar = lastPosition
+        if (collar != null) {
+            intent.putExtra("device_${idx}_id", dogConfig.uid)
+            intent.putExtra("device_${idx}_label", dogConfig.callsign)
+            intent.putExtra("device_${idx}_collar", true)
+            intent.putExtra("device_${idx}_lat", collar.latitude)
+            intent.putExtra("device_${idx}_lon", collar.longitude)
+            intent.putExtra("device_${idx}_time", collar.timestamp)
+            intent.putExtra("device_${idx}_type", "collar")
 
-        if (hh != null) {
-            val dist = GeoUtils.calculateDistance(
-                hh.latitude, hh.longitude,
-                collarPosition.latitude, collarPosition.longitude
-            )
-            val bearing = GeoUtils.calculateBearing(
-                hh.latitude, hh.longitude,
-                collarPosition.latitude, collarPosition.longitude
-            )
-            intent.putExtra("device_${idx}_bearing", bearing)
-            intent.putExtra("device_${idx}_distance", dist)
-        } else {
-            intent.putExtra("device_${idx}_bearing", Double.NaN)
-            intent.putExtra("device_${idx}_distance", Double.NaN)
+            if (hh != null) {
+                intent.putExtra("device_${idx}_bearing", GeoUtils.calculateBearing(
+                    hh.latitude, hh.longitude, collar.latitude, collar.longitude))
+                intent.putExtra("device_${idx}_distance", GeoUtils.calculateDistance(
+                    hh.latitude, hh.longitude, collar.latitude, collar.longitude))
+            } else {
+                intent.putExtra("device_${idx}_bearing", Double.NaN)
+                intent.putExtra("device_${idx}_distance", Double.NaN)
+            }
+            idx++
         }
-        idx++
+
+        // Contact device (remote Alpha handheld seen via VHF)
+        val contact = contactPosition
+        if (contact != null) {
+            intent.putExtra("device_${idx}_id", "contact")
+            intent.putExtra("device_${idx}_label", "Contact")
+            intent.putExtra("device_${idx}_collar", false)
+            intent.putExtra("device_${idx}_lat", contact.latitude)
+            intent.putExtra("device_${idx}_lon", contact.longitude)
+            intent.putExtra("device_${idx}_time", contact.timestamp)
+            intent.putExtra("device_${idx}_type", "contact")
+
+            if (hh != null) {
+                intent.putExtra("device_${idx}_bearing", GeoUtils.calculateBearing(
+                    hh.latitude, hh.longitude, contact.latitude, contact.longitude))
+                intent.putExtra("device_${idx}_distance", GeoUtils.calculateDistance(
+                    hh.latitude, hh.longitude, contact.latitude, contact.longitude))
+            } else {
+                intent.putExtra("device_${idx}_bearing", Double.NaN)
+                intent.putExtra("device_${idx}_distance", Double.NaN)
+            }
+            idx++
+        }
 
         intent.putExtra(EXTRA_DEVICE_COUNT, idx)
         sendBroadcast(intent)

@@ -232,6 +232,8 @@ class MainActivity : AppCompatActivity() {
             val bearing = intent.getDoubleExtra("device_${i}_bearing", Double.NaN)
             val distance = intent.getDoubleExtra("device_${i}_distance", Double.NaN)
 
+            val type = intent.getStringExtra("device_${i}_type") ?: if (isCollar) "collar" else "handheld"
+
             devices.add(TrackedDevice(
                 id = id,
                 label = label,
@@ -240,7 +242,8 @@ class MainActivity : AppCompatActivity() {
                 longitude = lon,
                 lastUpdateTime = time,
                 bearing = if (bearing.isNaN()) null else bearing,
-                distanceMeters = if (distance.isNaN()) null else distance
+                distanceMeters = if (distance.isNaN()) null else distance,
+                deviceType = type
             ))
         }
 

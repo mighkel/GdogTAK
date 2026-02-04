@@ -37,7 +37,17 @@ object GarminProtocol {
     // Device type markers in position packets
     private const val DEVICE_COLLAR: Byte = 0x35
     private const val DEVICE_HANDHELD: Byte = 0x28
-    
+    private const val DEVICE_CONTACT: Byte = 0x33  // Other Alpha handhelds seen via VHF
+
+    /**
+     * Device types that can appear in BLE notifications
+     */
+    enum class DeviceType {
+        COLLAR,     // Dog collar (0x35) - local, directly paired
+        HANDHELD,   // Local Alpha handheld (0x28)
+        CONTACT     // Remote Alpha handheld seen via VHF (0x33)
+    }
+
     /**
      * Parsed position data from a BLE notification
      */
@@ -46,8 +56,26 @@ object GarminProtocol {
         val longitude: Double,
         val timestamp: Long,
         val isCollar: Boolean,
-        val rawTimestamp: Long = 0
+        val rawTimestamp: Long = 0,
+        val deviceType: DeviceType = if (isCollar) DeviceType.COLLAR else DeviceType.HANDHELD
     )
+
+    /**
+     * A collar device entry extracted from the 229-byte device registry (command 07_16)
+     */
+    data class CollarRegistryEntry(
+        val deviceId: ByteArray,   // 4-byte collar device ID (e.g., 33-91-77-CD)
+        val fullEntry: ByteArray   // Full 16-byte entry for building relay commands
+    ) {
+        fun deviceIdHex(): String = deviceId.joinToString("-") { "%02X".format(it) }
+
+        override fun equals(other: Any?): Boolean {
+            if (this === other) return true
+            if (other !is CollarRegistryEntry) return false
+            return deviceId.contentEquals(other.deviceId)
+        }
+        override fun hashCode(): Int = deviceId.contentHashCode()
+    }
     
     /**
      * Parse a BLE notification and extract position if present
@@ -60,15 +88,16 @@ object GarminProtocol {
             android.util.Log.d("GarminProtocol", "Packet too small: ${data.size} bytes")
             return null
         }
-        
+
         // Determine device type
         val isCollar = isCollarMessage(data)
         val isHandheld = isHandheldMessage(data)
-        
-        android.util.Log.i("GarminProtocol", "Device type: collar=$isCollar, handheld=$isHandheld")
+        val isContact = isContactMessage(data)
 
-        if (!isCollar && !isHandheld) {
-            android.util.Log.i("GarminProtocol", "No device marker found (02 35 or 02 28)")
+        android.util.Log.i("GarminProtocol", "Device type: collar=$isCollar, handheld=$isHandheld, contact=$isContact")
+
+        if (!isCollar && !isHandheld && !isContact) {
+            android.util.Log.i("GarminProtocol", "No device marker found (02 35, 02 28, or 02 33)")
             return null
         }
 
@@ -78,14 +107,21 @@ object GarminProtocol {
             android.util.Log.i("GarminProtocol", "No coordinates found in packet")
             return null
         }
-        
-        android.util.Log.i("GarminProtocol", ">>> COORDS PARSED: lat=${coords.first}, lon=${coords.second}, isCollar=$isCollar")
-        
+
+        val deviceType = when {
+            isCollar -> DeviceType.COLLAR
+            isContact -> DeviceType.CONTACT
+            else -> DeviceType.HANDHELD
+        }
+
+        android.util.Log.i("GarminProtocol", ">>> COORDS PARSED: lat=${coords.first}, lon=${coords.second}, type=$deviceType")
+
         return DogPosition(
             latitude = coords.first,
             longitude = coords.second,
             timestamp = System.currentTimeMillis(),
-            isCollar = isCollar
+            isCollar = isCollar,
+            deviceType = deviceType
         )
     }
     
@@ -101,6 +137,13 @@ object GarminProtocol {
      */
     private fun isHandheldMessage(data: ByteArray): Boolean {
         return findDeviceMarker(data, DEVICE_HANDHELD)
+    }
+
+    /**
+     * Check if this message contains contact (remote Alpha) position data
+     */
+    private fun isContactMessage(data: ByteArray): Boolean {
+        return findDeviceMarker(data, DEVICE_CONTACT)
     }
     
     /**
@@ -233,6 +276,60 @@ object GarminProtocol {
      */
     private fun semicirclesToDegrees(semicircles: Long): Double {
         return semicircles * (180.0 / 2147483648.0)
+    }
+
+    /**
+     * Parse the 229-byte device registry notification (command 07_16) to extract
+     * registered collar device IDs.
+     *
+     * The registry contains collar entries in the format:
+     *   0A 10 [16-byte device entry]
+     * where the first 4 bytes of the entry are the collar device ID.
+     *
+     * @param data Raw bytes from BLE notification (229 bytes, starts with DE XX 00 07 16)
+     * @return List of collar device entries found, empty if none
+     */
+    fun parseDeviceRegistry(data: ByteArray): List<CollarRegistryEntry> {
+        val entries = mutableListOf<CollarRegistryEntry>()
+
+        // Verify this is a device registry notification (command 07 16)
+        if (data.size < 50) return entries
+        if (data[3] != 0x07.toByte() || data[4] != 0x16.toByte()) {
+            android.util.Log.d("GarminProtocol", "Not a device registry (07_16) packet")
+            return entries
+        }
+
+        // Search for 0A 10 pattern (field 1, length 16 = device entry)
+        for (i in 0 until data.size - 17) {
+            if (data[i] == 0x0A.toByte() && data[i + 1] == 0x10.toByte()) {
+                val entryData = data.sliceArray(i + 2 until i + 18)
+                val deviceId = entryData.sliceArray(0 until 4)
+
+                // Sanity check: device ID should have non-trivial bytes
+                if (deviceId.any { it != 0x00.toByte() && it != 0x01.toByte() }) {
+                    val entry = CollarRegistryEntry(deviceId, entryData)
+                    if (!entries.any { it.deviceId.contentEquals(deviceId) }) {
+                        entries.add(entry)
+                        android.util.Log.i("GarminProtocol",
+                            ">>> REGISTRY: Found collar device ID: ${entry.deviceIdHex()}")
+                    }
+                }
+            }
+        }
+
+        android.util.Log.i("GarminProtocol",
+            "Device registry parsed: ${entries.size} collar(s) found")
+        return entries
+    }
+
+    /**
+     * Check if a notification is a device registry packet (command 07_16).
+     * These are 229 bytes and sent every ~20 seconds by the Alpha.
+     */
+    fun isDeviceRegistryPacket(data: ByteArray): Boolean {
+        return data.size > 50 &&
+               data[3] == 0x07.toByte() &&
+               data[4] == 0x16.toByte()
     }
 
     /**
