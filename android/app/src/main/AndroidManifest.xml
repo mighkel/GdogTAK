@@ -45,6 +45,11 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name=".SettingsActivity"
+            android:exported="false"
+            android:label="Settings"/>
+
         <service
             android:name=".ble.BleTrackingService"
             android:enabled="true"

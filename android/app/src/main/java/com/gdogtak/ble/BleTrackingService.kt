@@ -17,6 +17,8 @@ import android.provider.Settings
 import android.util.Log
 import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationCompat
+import com.gdogtak.AppPreferences
+import com.gdogtak.GeoUtils
 import com.gdogtak.MainActivity
 import com.gdogtak.R
 import com.gdogtak.cot.CotGenerator
@@ -50,6 +52,10 @@ class BleTrackingService : Service() {
         const val EXTRA_DOG_COUNT = "dog_count"
         const val EXTRA_LAST_LAT = "last_lat"
         const val EXTRA_LAST_LON = "last_lon"
+
+        // Device list broadcast
+        const val BROADCAST_DEVICES = "com.gdogtak.DEVICE_LIST_UPDATE"
+        const val EXTRA_DEVICE_COUNT = "device_count"
         
         // Init sequence timing
         private const val INIT_STEP_DELAY_MS = 150L
@@ -79,12 +85,11 @@ class BleTrackingService : Service() {
     // ATAK broadcaster
     private lateinit var atakBroadcaster: AtakBroadcaster
     
-    // Dog configuration (TODO: make configurable via settings)
-    private val dogConfig = CotGenerator.DogConfig(
-        uid = "GDOG-K9-001",
-        callsign = "K9-DOG1",
-        team = "SAR"
-    )
+    // Dog configuration - loaded from SharedPreferences
+    private lateinit var dogConfig: CotGenerator.DogConfig
+
+    // Tracked device positions (handheld + collars)
+    private var handheldPosition: GarminProtocol.DogPosition? = null
     
     // Tracking stats
     private var positionCount = 0
@@ -122,18 +127,27 @@ class BleTrackingService : Service() {
     override fun onCreate() {
         super.onCreate()
         Log.i(TAG, "Service created")
-        
+
+        // Load dog config from SharedPreferences
+        val prefs = AppPreferences(this)
+        dogConfig = CotGenerator.DogConfig(
+            uid = prefs.dogUid,
+            callsign = prefs.dogCallsign,
+            team = prefs.teamName
+        )
+        Log.i(TAG, "Dog config: callsign=${dogConfig.callsign}, uid=${dogConfig.uid}, team=${dogConfig.team}")
+
         // Initialize Bluetooth
         val bluetoothManager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
         bluetoothAdapter = bluetoothManager.adapter
         bleScanner = bluetoothAdapter?.bluetoothLeScanner
-        
+
         // Initialize ATAK broadcaster
         atakBroadcaster = AtakBroadcaster(this)
-        
+
         // Generate device ID for init sequence
         deviceId = generateDeviceId()
-        
+
         // Create notification channel
         createNotificationChannel()
     }
@@ -1326,20 +1340,20 @@ class BleTrackingService : Service() {
         if (position.isCollar) {
             positionCount++
             lastPosition = position
-            
+
             Log.i(TAG, ">>> DOG POSITION #$positionCount: ${position.latitude}, ${position.longitude}")
-            
+
             // Generate and send CoT
             val cot = CotGenerator.generateCot(position, dogConfig)
             Log.d(TAG, ">>> Generated CoT for ${dogConfig.callsign}")
-            
+
             serviceScope.launch {
                 val sent = atakBroadcaster.sendCot(cot)
                 Log.i(TAG, ">>> CoT SENT: $sent")
-                
+
                 if (sent) {
                     updateStatus(
-                        Status.TRACKING, 
+                        Status.TRACKING,
                         "Tracking: $positionCount positions",
                         position.latitude,
                         position.longitude
@@ -1348,11 +1362,18 @@ class BleTrackingService : Service() {
                     Log.e(TAG, ">>> CoT send FAILED!")
                 }
             }
-            
+
             // Update notification
             updateNotification("Tracking: ${position.latitude.format(5)}, ${position.longitude.format(5)}")
+
+            // Broadcast device list update
+            broadcastDeviceList(position)
         } else {
-            Log.d(TAG, "Skipping handheld position (not collar)")
+            // Track handheld position for bearing/distance calculations
+            handheldPosition = position
+            Log.d(TAG, "Handheld position: ${position.latitude}, ${position.longitude}")
+            // Also broadcast device list when handheld updates
+            lastPosition?.let { broadcastDeviceList(it) }
         }
     }
     
@@ -1388,8 +1409,59 @@ class BleTrackingService : Service() {
     /**
      * Update status and broadcast to UI
      */
+    /**
+     * Broadcast the tracked device list to the UI.
+     * Currently tracks one collar and optionally the handheld.
+     */
+    private fun broadcastDeviceList(collarPosition: GarminProtocol.DogPosition) {
+        val intent = Intent(BROADCAST_DEVICES)
+        var idx = 0
+
+        // Handheld device (reference point)
+        val hh = handheldPosition
+        if (hh != null) {
+            intent.putExtra("device_${idx}_id", "handheld")
+            intent.putExtra("device_${idx}_label", "Alpha 300")
+            intent.putExtra("device_${idx}_collar", false)
+            intent.putExtra("device_${idx}_lat", hh.latitude)
+            intent.putExtra("device_${idx}_lon", hh.longitude)
+            intent.putExtra("device_${idx}_time", System.currentTimeMillis())
+            intent.putExtra("device_${idx}_bearing", Double.NaN)
+            intent.putExtra("device_${idx}_distance", Double.NaN)
+            idx++
+        }
+
+        // Collar device
+        intent.putExtra("device_${idx}_id", dogConfig.uid)
+        intent.putExtra("device_${idx}_label", dogConfig.callsign)
+        intent.putExtra("device_${idx}_collar", true)
+        intent.putExtra("device_${idx}_lat", collarPosition.latitude)
+        intent.putExtra("device_${idx}_lon", collarPosition.longitude)
+        intent.putExtra("device_${idx}_time", System.currentTimeMillis())
+
+        if (hh != null) {
+            val dist = GeoUtils.calculateDistance(
+                hh.latitude, hh.longitude,
+                collarPosition.latitude, collarPosition.longitude
+            )
+            val bearing = GeoUtils.calculateBearing(
+                hh.latitude, hh.longitude,
+                collarPosition.latitude, collarPosition.longitude
+            )
+            intent.putExtra("device_${idx}_bearing", bearing)
+            intent.putExtra("device_${idx}_distance", dist)
+        } else {
+            intent.putExtra("device_${idx}_bearing", Double.NaN)
+            intent.putExtra("device_${idx}_distance", Double.NaN)
+        }
+        idx++
+
+        intent.putExtra(EXTRA_DEVICE_COUNT, idx)
+        sendBroadcast(intent)
+    }
+
     private fun updateStatus(
-        status: Status, 
+        status: Status,
         message: String,
         lat: Double? = null,
         lon: Double? = null

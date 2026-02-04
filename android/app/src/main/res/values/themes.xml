@@ -1,7 +1,23 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
 
+    <!-- Light theme -->
     <style name="Theme.GdogTAK" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+    </style>
+
+    <!-- NVG (Nightvision) theme - ATAK-style dark green on black -->
+    <style name="Theme.GdogTAK.NVG" parent="Theme.MaterialComponents.NoActionBar">
+        <item name="colorPrimary">@color/nvg_accent</item>
+        <item name="colorPrimaryDark">@color/nvg_background</item>
+        <item name="colorAccent">@color/nvg_accent</item>
+        <item name="android:colorBackground">@color/nvg_background</item>
+        <item name="android:textColorPrimary">@color/nvg_text_primary</item>
+        <item name="android:textColorSecondary">@color/nvg_text_secondary</item>
+        <item name="android:textColorTertiary">@color/nvg_text_dim</item>
+        <item name="android:windowBackground">@color/nvg_background</item>
+        <item name="colorSurface">@color/nvg_card</item>
+        <item name="colorOnSurface">@color/nvg_text_primary</item>
+        <item name="colorOnPrimary">@color/nvg_background</item>
     </style>
 
 </resources>

@@ -7,4 +7,13 @@
     <color name="teal_700">#FF018786</color>
     <color name="black">#FF000000</color>
     <color name="white">#FFFFFFFF</color>
+
+    <!-- NVG (Nightvision) palette - ATAK-style -->
+    <color name="nvg_background">#FF000000</color>
+    <color name="nvg_card">#FF0A1A0A</color>
+    <color name="nvg_text_primary">#FF2E7D32</color>
+    <color name="nvg_text_secondary">#FF1B5E20</color>
+    <color name="nvg_text_dim">#FF0D3B0D</color>
+    <color name="nvg_accent">#FF388E3C</color>
+    <color name="nvg_divider">#FF1B3A1B</color>
 </resources>

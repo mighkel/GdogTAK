@@ -11,12 +11,13 @@ import android.os.Bundle
 import android.os.IBinder
 import android.provider.Settings
 import android.util.Log
+import android.view.View
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
-import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.recyclerview.widget.LinearLayoutManager
 import com.gdogtak.ble.BleTrackingService
 import com.gdogtak.databinding.ActivityMainBinding
 
@@ -27,8 +28,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private lateinit var binding: ActivityMainBinding
+    private lateinit var prefs: AppPreferences
     private var trackingService: BleTrackingService? = null
     private var serviceBound = false
+    private lateinit var deviceAdapter: TrackedDeviceAdapter
 
     // Permission request launcher
     private val permissionLauncher = registerForActivityResult(
@@ -81,12 +84,17 @@ class MainActivity : AppCompatActivity() {
                 val lon = intent.getDoubleExtra(BleTrackingService.EXTRA_LAST_LON, 0.0)
 
                 updateStatusDisplay(status, message, dogCount, lat, lon)
+            } else if (intent?.action == BleTrackingService.BROADCAST_DEVICES) {
+                updateDeviceList(intent)
             }
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        prefs = AppPreferences(this)
+        applyCurrentTheme()
         super.onCreate(savedInstanceState)
+
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
@@ -101,13 +109,22 @@ class MainActivity : AppCompatActivity() {
             bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
         }
 
-        // Register for status broadcasts
-        val filter = IntentFilter(BleTrackingService.BROADCAST_STATUS)
+        // Register for status and device broadcasts
+        val filter = IntentFilter().apply {
+            addAction(BleTrackingService.BROADCAST_STATUS)
+            addAction(BleTrackingService.BROADCAST_DEVICES)
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(statusReceiver, filter, RECEIVER_NOT_EXPORTED)
         } else {
             registerReceiver(statusReceiver, filter)
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // Reload prefs in case settings changed
+        deviceAdapter.useImperial = prefs.unitSystem == AppPreferences.UNITS_IMPERIAL
     }
 
     override fun onStop() {
@@ -125,7 +142,21 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun applyCurrentTheme() {
+        val theme = prefs.displayTheme
+        SettingsActivity.applyTheme(theme)
+        if (theme == AppPreferences.THEME_NVG) {
+            setTheme(R.style.Theme_GdogTAK_NVG)
+        }
+    }
+
     private fun setupUI() {
+        // Settings gear
+        binding.buttonSettings.setOnClickListener {
+            startActivity(Intent(this, SettingsActivity::class.java))
+        }
+
+        // Start/Stop button
         binding.buttonStartStop.setOnClickListener {
             if (isServiceRunning()) {
                 stopTrackingService()
@@ -133,6 +164,11 @@ class MainActivity : AppCompatActivity() {
                 requestPermissionsAndStart()
             }
         }
+
+        // Device list RecyclerView
+        deviceAdapter = TrackedDeviceAdapter(prefs.unitSystem == AppPreferences.UNITS_IMPERIAL)
+        binding.recyclerDevices.layoutManager = LinearLayoutManager(this)
+        binding.recyclerDevices.adapter = deviceAdapter
 
         updateUI()
     }
@@ -164,13 +200,52 @@ class MainActivity : AppCompatActivity() {
         binding.textPositionCount.text = "Positions: $dogCount"
 
         if (lat != 0.0 && lon != 0.0) {
-            binding.textLastPosition.text = "Last: %.6f, %.6f".format(lat, lon)
+            binding.textLastPosition.text = "%.6f, %.6f".format(lat, lon)
         }
 
         // Update button state
         val isTracking = status == "TRACKING" || status == "SCANNING" ||
                 status == "CONNECTING" || status == "CONNECTED"
         binding.buttonStartStop.text = if (isTracking) "Stop Tracking" else "Start Tracking"
+    }
+
+    private fun updateDeviceList(intent: Intent) {
+        val count = intent.getIntExtra(BleTrackingService.EXTRA_DEVICE_COUNT, 0)
+        if (count == 0) {
+            binding.textNoDevices.visibility = View.VISIBLE
+            binding.recyclerDevices.visibility = View.GONE
+            deviceAdapter.submitList(emptyList())
+            return
+        }
+
+        binding.textNoDevices.visibility = View.GONE
+        binding.recyclerDevices.visibility = View.VISIBLE
+
+        val devices = mutableListOf<TrackedDevice>()
+        for (i in 0 until count) {
+            val id = intent.getStringExtra("device_${i}_id") ?: continue
+            val label = intent.getStringExtra("device_${i}_label") ?: id
+            val isCollar = intent.getBooleanExtra("device_${i}_collar", true)
+            val lat = intent.getDoubleExtra("device_${i}_lat", 0.0)
+            val lon = intent.getDoubleExtra("device_${i}_lon", 0.0)
+            val time = intent.getLongExtra("device_${i}_time", 0L)
+            val bearing = intent.getDoubleExtra("device_${i}_bearing", Double.NaN)
+            val distance = intent.getDoubleExtra("device_${i}_distance", Double.NaN)
+
+            devices.add(TrackedDevice(
+                id = id,
+                label = label,
+                isCollar = isCollar,
+                latitude = lat,
+                longitude = lon,
+                lastUpdateTime = time,
+                bearing = if (bearing.isNaN()) null else bearing,
+                distanceMeters = if (distance.isNaN()) null else distance
+            ))
+        }
+
+        deviceAdapter.useImperial = prefs.unitSystem == AppPreferences.UNITS_IMPERIAL
+        deviceAdapter.submitList(devices)
     }
 
     private fun requestPermissionsAndStart() {
@@ -252,6 +327,9 @@ class MainActivity : AppCompatActivity() {
 
         binding.textStatus.text = "Stopped"
         binding.buttonStartStop.text = "Start Tracking"
+        binding.textNoDevices.visibility = View.VISIBLE
+        binding.recyclerDevices.visibility = View.GONE
+        deviceAdapter.submitList(emptyList())
     }
 
     private fun isServiceRunning(): Boolean {
