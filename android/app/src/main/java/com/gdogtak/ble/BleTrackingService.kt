@@ -704,20 +704,30 @@ class BleTrackingService : Service() {
      * Phase 1: Device ID exchange
      */
     private fun sendInitPhase1(gatt: BluetoothGatt, char: BluetoothGattCharacteristic, id: ByteArray) {
+        // Alpha init sequence - Device ID exchange
+        // cmd1: 00 05 [8-byte ID] 00 00 (12 bytes) - Device ID send
+        // cmd2: 00 00 [8-byte ID] 04 00 00 (13 bytes) - Device ID confirm
         val cmd1 = byteArrayOf(0x00, 0x05).plus(id).plus(byteArrayOf(0x00, 0x00))
         val cmd2 = byteArrayOf(0x00, 0x00).plus(id).plus(byteArrayOf(0x04, 0x00, 0x00))
-        
-        Log.d(TAG, "Init phase 1 - Device ID exchange")
-        sendCommand(gatt, char, cmd1, "ID send")
-        
+
+        Log.i(TAG, "Init phase 1 - Device ID exchange")
+        Log.i(TAG, "  cmd1 (ID send, 12B): ${cmd1.toHexString()}")
+        Log.i(TAG, "  cmd2 (ID confirm, 13B): ${cmd2.toHexString()}")
+
+        // IMPORTANT: Schedule cmd1 with a delay to ensure previous BLE operations complete
+        // Android BLE can only have one pending write at a time - synchronous calls get dropped
         bleHandler.postDelayed({
-            sendCommand(gatt, char, cmd2, "ID confirm")
-            
-            // Wait for response with channel prefix, then continue
+            sendCommand(gatt, char, cmd1, "ID send")
+
             bleHandler.postDelayed({
-                sendInitPhase2(gatt, char, id)
-            }, 300)  // Wait for prefix response
-        }, INIT_STEP_DELAY_MS)
+                sendCommand(gatt, char, cmd2, "ID confirm")
+
+                // Wait for response with channel prefix, then continue
+                bleHandler.postDelayed({
+                    sendInitPhase2(gatt, char, id)
+                }, 300)  // Wait for prefix response
+            }, INIT_STEP_DELAY_MS)
+        }, 100)  // Small delay to let previous BLE writes complete
     }
     
     /**
