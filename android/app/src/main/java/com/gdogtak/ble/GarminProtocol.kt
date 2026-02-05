@@ -17,7 +17,12 @@ object GarminProtocol {
     
     // Garmin Multi-Link Service UUID
     const val SERVICE_UUID = "6a4e2800-667b-11e3-949a-0800200c9a66"
-    
+
+    // Control characteristic for "app connected" signal - Alpha writes 02 00 here FIRST
+    // This is the first characteristic in the service (handle 0x000D in btsnoop)
+    // Writing 02 00 signals the Alpha that a valid app has connected
+    const val CONTROL_INIT_CHAR_UUID = "6a4e2801-667b-11e3-949a-0800200c9a66"  // App connect signal
+
     // Write characteristics - based on btsnoop analysis of working Alpha app session:
     // - Alpha app sends INIT sequence to 6a4e2824 (handle 0x0029)
     // - Alpha app sends 02_35 POLLING to 6a4e2821 (handle 0x001A)

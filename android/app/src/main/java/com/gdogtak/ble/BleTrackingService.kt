@@ -107,10 +107,13 @@ class BleTrackingService : Service() {
     private var cccdWriteQueue: MutableList<BluetoothGattDescriptor> = mutableListOf()
     private var writeCharacteristic: BluetoothGattCharacteristic? = null
     private var writeCharacteristic2: BluetoothGattCharacteristic? = null  // Second write char for dual init
+    private var controlInitChar: BluetoothGattCharacteristic? = null  // Control char for "02 00" app connect signal
     
     // Dynamically assigned data channel from Alpha
     private var assignedChannel: Byte = 0x0f  // Default, will be updated from response
-    private var channelPrefix: Byte = 0x2f  // Channel prefix from device, varies each session
+    // Channel prefix for init commands - btsnoop shows Alpha app ALWAYS uses 0x04
+    // Previous approach of dynamic assignment was producing 0x01 which doesn't work
+    private var channelPrefix: Byte = 0x04  // Alpha uses 0x04 consistently
 
     // Device ID for init sequence (generated once per app install)
     private var deviceId: ByteArray? = null
@@ -442,18 +445,40 @@ class BleTrackingService : Service() {
                 Log.i(TAG, "  Char: ${char.uuid.toString().takeLast(8)} instance=${char.instanceId} props=$propsStr (${char.properties})")
             }
             
+            // Find control init characteristic - Alpha writes "02 00" here FIRST
+            // This signals the Alpha that a valid app has connected
+            val controlInitUuid = UUID.fromString(GarminProtocol.CONTROL_INIT_CHAR_UUID)
+            controlInitChar = service.characteristics
+                .filter { it.uuid == controlInitUuid }
+                .minByOrNull { it.instanceId }
+
+            // If specific UUID not found, try to find characteristic with lowest instanceId
+            // that has write capability (this is the first char in service = handle 0x000D)
+            if (controlInitChar == null) {
+                controlInitChar = service.characteristics
+                    .filter { it.properties and BluetoothGattCharacteristic.PROPERTY_WRITE != 0 ||
+                             it.properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0 }
+                    .minByOrNull { it.instanceId }
+            }
+
+            if (controlInitChar != null) {
+                Log.i(TAG, ">>> Control init char found: ${controlInitChar?.uuid.toString().takeLast(8)} instance=${controlInitChar?.instanceId}")
+            } else {
+                Log.w(TAG, "Control init characteristic not found - will skip 02 00 handshake")
+            }
+
             // Find write characteristics - get FIRST instance (lowest instanceId)
             // Alpha app uses specific instances that receive collar data
             val writeUuid1 = UUID.fromString(GarminProtocol.WRITE_CHAR_UUID)
             val writeUuid2 = UUID.fromString(GarminProtocol.WRITE_CHAR_UUID_2)
-            
+
             writeCharacteristic = service.characteristics
                 .filter { it.uuid == writeUuid1 }
                 .minByOrNull { it.instanceId }
             writeCharacteristic2 = service.characteristics
                 .filter { it.uuid == writeUuid2 }
                 .minByOrNull { it.instanceId }
-            
+
             if (writeCharacteristic == null) {
                 Log.w(TAG, "Write characteristic 1 not found, init sequence may fail")
             } else {
@@ -464,32 +489,52 @@ class BleTrackingService : Service() {
             } else {
                 Log.i(TAG, "Write characteristic 2 found: ${GarminProtocol.WRITE_CHAR_UUID_2} instance=${writeCharacteristic2?.instanceId}")
             }
-            
-            // Build list of FIRST instance of each notification characteristic to subscribe to
-            // Alpha subscribes to ONE specific instance that receives collar data
+
+            // Build list of notification characteristics to subscribe to
+            // KEY INSIGHT: Alpha app only subscribes to ONE channel (0x0027 = 6a4e2814, notify channel 5)
+            // Not all 5 channels like we were doing before!
             cccdWriteQueue.clear()
             val cccdUuid = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
-            
-            for (charUuid in GarminProtocol.NOTIFY_CHAR_UUIDS) {
-                val uuid = UUID.fromString(charUuid)
-                // Get FIRST instance (lowest instanceId) of this characteristic
-                val characteristic = service.characteristics
-                    .filter { it.uuid == uuid }
-                    .minByOrNull { it.instanceId }
-                    
-                if (characteristic != null) {
-                    val descriptor = characteristic.getDescriptor(cccdUuid)
-                    if (descriptor != null) {
-                        cccdWriteQueue.add(descriptor)
-                        Log.i(TAG, "Queued subscription for: $charUuid instance=${characteristic.instanceId}")
+
+            // Only subscribe to the LAST notify characteristic (6a4e2814 = channel 5)
+            // This matches Alpha app behavior observed in btsnoop
+            val notifyChannel5Uuid = UUID.fromString(GarminProtocol.NOTIFY_CHAR_UUIDS.last())  // 6a4e2814
+            val notifyChar = service.characteristics
+                .filter { it.uuid == notifyChannel5Uuid }
+                .minByOrNull { it.instanceId }
+
+            if (notifyChar != null) {
+                val descriptor = notifyChar.getDescriptor(cccdUuid)
+                if (descriptor != null) {
+                    cccdWriteQueue.add(descriptor)
+                    Log.i(TAG, ">>> Queued subscription for CHANNEL 5 ONLY: ${notifyChannel5Uuid.toString().takeLast(8)} instance=${notifyChar.instanceId}")
+                }
+            } else {
+                Log.w(TAG, "Notify channel 5 not found, falling back to all channels")
+                // Fallback: subscribe to all channels
+                for (charUuid in GarminProtocol.NOTIFY_CHAR_UUIDS) {
+                    val uuid = UUID.fromString(charUuid)
+                    val characteristic = service.characteristics
+                        .filter { it.uuid == uuid }
+                        .minByOrNull { it.instanceId }
+
+                    if (characteristic != null) {
+                        val descriptor = characteristic.getDescriptor(cccdUuid)
+                        if (descriptor != null) {
+                            cccdWriteQueue.add(descriptor)
+                            Log.i(TAG, "Queued subscription for: $charUuid instance=${characteristic.instanceId}")
+                        }
                     }
-                } else {
-                    Log.w(TAG, "Characteristic not found: $charUuid")
                 }
             }
-            
-            // Start subscribing to characteristics
-            if (cccdWriteQueue.isNotEmpty()) {
+
+            // CRITICAL: Write "02 00" to control init characteristic FIRST
+            // This is the "app connected" signal that Alpha sends before anything else
+            if (controlInitChar != null) {
+                updateStatus(Status.INITIALIZING, "Sending app connect signal...")
+                sendAppConnectSignal(gatt, controlInitChar!!)
+            } else if (cccdWriteQueue.isNotEmpty()) {
+                // No control char found, proceed with CCCD subscriptions
                 updateStatus(Status.INITIALIZING, "Subscribing to ${cccdWriteQueue.size} channels...")
                 writeNextCccd(gatt)
             } else {
@@ -556,16 +601,56 @@ class BleTrackingService : Service() {
     }
     
     /**
+     * Send "02 00" app connect signal to control init characteristic
+     * This is the FIRST thing Alpha app does - signals that a valid app has connected
+     * After this write, proceed with CCCD subscriptions
+     */
+    private fun sendAppConnectSignal(gatt: BluetoothGatt, char: BluetoothGattCharacteristic) {
+        Log.i(TAG, ">>> SENDING APP CONNECT SIGNAL: 02 00 to ${char.uuid.toString().takeLast(8)} instance=${char.instanceId}")
+
+        try {
+            val cmd = byteArrayOf(0x02, 0x00)
+            char.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT  // Use write with response
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                gatt.writeCharacteristic(char, cmd, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
+            } else {
+                @Suppress("DEPRECATION")
+                char.value = cmd
+                @Suppress("DEPRECATION")
+                gatt.writeCharacteristic(char)
+            }
+
+            // After write completes (or after delay), proceed with CCCD subscriptions
+            bleHandler.postDelayed({
+                if (cccdWriteQueue.isNotEmpty()) {
+                    updateStatus(Status.INITIALIZING, "Subscribing to ${cccdWriteQueue.size} channels...")
+                    writeNextCccd(gatt)
+                } else if (!initSequenceStarted) {
+                    Log.i(TAG, ">>> No CCCDs to write - Starting init sequence!")
+                    startInitSequence(gatt)
+                }
+            }, 500)  // Wait 500ms for app connect signal to be processed
+
+        } catch (e: SecurityException) {
+            Log.e(TAG, "Security exception sending app connect signal", e)
+            // Proceed with CCCD subscriptions anyway
+            if (cccdWriteQueue.isNotEmpty()) {
+                writeNextCccd(gatt)
+            }
+        }
+    }
+
+    /**
      * Write next CCCD in queue
      */
     private fun writeNextCccd(gatt: BluetoothGatt) {
         if (cccdWriteQueue.isEmpty()) return
-        
+
         val descriptor = cccdWriteQueue.removeAt(0)
         try {
             // Enable local notifications
             gatt.setCharacteristicNotification(descriptor.characteristic, true)
-            
+
             // Write to remote CCCD
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 gatt.writeDescriptor(descriptor, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
