@@ -445,26 +445,31 @@ class BleTrackingService : Service() {
                 Log.i(TAG, "  Char: ${char.uuid.toString().takeLast(8)} instance=${char.instanceId} props=$propsStr (${char.properties})")
             }
             
-            // Find control init characteristic - Alpha writes "02 00" here FIRST
-            // This signals the Alpha that a valid app has connected
-            val controlInitUuid = UUID.fromString(GarminProtocol.CONTROL_INIT_CHAR_UUID)
-            controlInitChar = service.characteristics
-                .filter { it.uuid == controlInitUuid }
-                .minByOrNull { it.instanceId }
+            // CRITICAL: Alpha writes "02 00" to handle 0x000D FIRST
+            // Btsnoop analysis reveals this is the CCCD for "Service Changed" (00002a05)
+            // This enables indications on Service Changed - standard BLE best practice
+            // We need to find it across ALL services, not just Garmin
+            val serviceChangedUuid = UUID.fromString("00002a05-0000-1000-8000-00805f9b34fb")
+            val cccdUuid = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+            var serviceChangedCccd: BluetoothGattDescriptor? = null
 
-            // If specific UUID not found, try to find characteristic with lowest instanceId
-            // that has write capability (this is the first char in service = handle 0x000D)
-            if (controlInitChar == null) {
-                controlInitChar = service.characteristics
-                    .filter { it.properties and BluetoothGattCharacteristic.PROPERTY_WRITE != 0 ||
-                             it.properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0 }
-                    .minByOrNull { it.instanceId }
+            for (svc in gatt.services) {
+                val serviceChangedChar = svc.characteristics.find { it.uuid == serviceChangedUuid }
+                if (serviceChangedChar != null) {
+                    serviceChangedCccd = serviceChangedChar.getDescriptor(cccdUuid)
+                    if (serviceChangedCccd != null) {
+                        Log.i(TAG, ">>> Found Service Changed CCCD in service ${svc.uuid.toString().takeLast(8)} instance=${serviceChangedChar.instanceId}")
+                        break
+                    }
+                }
             }
 
-            if (controlInitChar != null) {
-                Log.i(TAG, ">>> Control init char found: ${controlInitChar?.uuid.toString().takeLast(8)} instance=${controlInitChar?.instanceId}")
+            if (serviceChangedCccd != null) {
+                // Store for later - we'll enable indications first
+                controlInitChar = null  // Not used anymore
+                Log.i(TAG, ">>> Will enable Service Changed indications (handle 0x000D equivalent)")
             } else {
-                Log.w(TAG, "Control init characteristic not found - will skip 02 00 handshake")
+                Log.w(TAG, "Service Changed characteristic not found - Alpha handshake may fail")
             }
 
             // Find write characteristics - get FIRST instance (lowest instanceId)
@@ -494,7 +499,7 @@ class BleTrackingService : Service() {
             // KEY INSIGHT: Alpha app only subscribes to ONE channel (0x0027 = 6a4e2814, notify channel 5)
             // Not all 5 channels like we were doing before!
             cccdWriteQueue.clear()
-            val cccdUuid = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+            // cccdUuid already defined above for Service Changed
 
             // Only subscribe to the LAST notify characteristic (6a4e2814 = channel 5)
             // This matches Alpha app behavior observed in btsnoop
@@ -528,13 +533,13 @@ class BleTrackingService : Service() {
                 }
             }
 
-            // CRITICAL: Write "02 00" to control init characteristic FIRST
-            // This is the "app connected" signal that Alpha sends before anything else
-            if (controlInitChar != null) {
-                updateStatus(Status.INITIALIZING, "Sending app connect signal...")
-                sendAppConnectSignal(gatt, controlInitChar!!)
+            // CRITICAL: Enable Service Changed indications FIRST (write 02 00 to handle 0x000D)
+            // This is what Alpha app does before anything else
+            if (serviceChangedCccd != null) {
+                updateStatus(Status.INITIALIZING, "Enabling Service Changed indications...")
+                enableServiceChangedIndications(gatt, serviceChangedCccd)
             } else if (cccdWriteQueue.isNotEmpty()) {
-                // No control char found, proceed with CCCD subscriptions
+                // No Service Changed found, proceed with CCCD subscriptions
                 updateStatus(Status.INITIALIZING, "Subscribing to ${cccdWriteQueue.size} channels...")
                 writeNextCccd(gatt)
             } else {
@@ -601,23 +606,25 @@ class BleTrackingService : Service() {
     }
     
     /**
-     * Send "02 00" app connect signal to control init characteristic
-     * This is the FIRST thing Alpha app does - signals that a valid app has connected
-     * After this write, proceed with CCCD subscriptions
+     * Enable indications on Service Changed characteristic (write 02 00 to its CCCD)
+     * This is the FIRST thing Alpha app does - writes to handle 0x000D
+     * After this write, proceed with other CCCD subscriptions
      */
-    private fun sendAppConnectSignal(gatt: BluetoothGatt, char: BluetoothGattCharacteristic) {
-        Log.i(TAG, ">>> SENDING APP CONNECT SIGNAL: 02 00 to ${char.uuid.toString().takeLast(8)} instance=${char.instanceId}")
+    private fun enableServiceChangedIndications(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor) {
+        Log.i(TAG, ">>> ENABLING SERVICE CHANGED INDICATIONS (02 00 to CCCD, handle 0x000D equivalent)")
 
         try {
-            val cmd = byteArrayOf(0x02, 0x00)
-            char.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT  // Use write with response
+            // Enable indications on the characteristic first
+            gatt.setCharacteristicNotification(descriptor.characteristic, true)
+
+            // Write ENABLE_INDICATION_VALUE (0x0002 = "02 00") to the CCCD
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                gatt.writeCharacteristic(char, cmd, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
+                gatt.writeDescriptor(descriptor, BluetoothGattDescriptor.ENABLE_INDICATION_VALUE)
             } else {
                 @Suppress("DEPRECATION")
-                char.value = cmd
+                descriptor.value = BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
                 @Suppress("DEPRECATION")
-                gatt.writeCharacteristic(char)
+                gatt.writeDescriptor(descriptor)
             }
 
             // After write completes (or after delay), proceed with CCCD subscriptions
@@ -629,10 +636,10 @@ class BleTrackingService : Service() {
                     Log.i(TAG, ">>> No CCCDs to write - Starting init sequence!")
                     startInitSequence(gatt)
                 }
-            }, 500)  // Wait 500ms for app connect signal to be processed
+            }, 500)  // Wait 500ms for Service Changed indication enable to be processed
 
         } catch (e: SecurityException) {
-            Log.e(TAG, "Security exception sending app connect signal", e)
+            Log.e(TAG, "Security exception enabling Service Changed indications", e)
             // Proceed with CCCD subscriptions anyway
             if (cccdWriteQueue.isNotEmpty()) {
                 writeNextCccd(gatt)
@@ -1442,17 +1449,18 @@ class BleTrackingService : Service() {
         
         // Parse channel prefix from device ID confirm response
         // Format: 00 01 [8-byte ID] 04 00 00 [prefix] 00 01
+        // NOTE: Btsnoop analysis shows Alpha ALWAYS uses 0x04 for channel enables,
+        // regardless of what the device response contains. Dynamic prefix caused issues
+        // (device returned 0x01 but Alpha uses 0x04), so we now hardcode 0x04.
         if (data.size >= 16 && data[0] == 0x00.toByte() && data[1] == 0x01.toByte()) {
             // Check command byte at position 10
             val cmdByte = data[10].toInt() and 0xFF
-            
+
             if (cmdByte == 0x04 && data.size >= 14) {
-                // Device ID confirm response - extract channel prefix from byte 13
-                val newPrefix = data[13]
-                if (newPrefix != 0x00.toByte()) {
-                    channelPrefix = newPrefix
-                    Log.i(TAG, ">>> CHANNEL PREFIX: 0x${"%02x".format(newPrefix)} (${newPrefix.toInt() and 0xFF})")
-                }
+                // Device ID confirm response - log but DON'T update channelPrefix
+                // Alpha app uses 0x04 regardless of device response
+                val devicePrefix = data[13]
+                Log.i(TAG, ">>> Device suggests prefix 0x${"%02x".format(devicePrefix)} but using hardcoded 0x04 (like Alpha)")
             } else if (cmdByte == 0x01 && data.size >= 14) {
                 // Channel 1 subscription response - extract assigned channel
                 val newChannel = data[13]
