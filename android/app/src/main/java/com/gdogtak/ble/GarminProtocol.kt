@@ -18,11 +18,12 @@ object GarminProtocol {
     // Garmin Multi-Link Service UUID
     const val SERVICE_UUID = "6a4e2800-667b-11e3-949a-0800200c9a66"
     
-    // Write characteristics for init sequence commands
-    // CRITICAL: Must use 6a4e2821 (handle 0x001A) - this is where the Alpha app sends commands!
-    // Using 6a4e2823 was incorrect and caused collar data relay to not work.
-    const val WRITE_CHAR_UUID = "6a4e2821-667b-11e3-949a-0800200c9a66"  // Channel 2 - PRIMARY WRITE (handle 0x1A)
-    const val WRITE_CHAR_UUID_2 = "6a4e2820-667b-11e3-949a-0800200c9a66"  // Channel 1 - SECONDARY WRITE (handle 0x16)
+    // Write characteristics - based on btsnoop analysis of working Alpha app session:
+    // - Alpha app sends INIT sequence to 6a4e2824 (handle 0x0029)
+    // - Alpha app sends 02_35 POLLING to 6a4e2821 (handle 0x001A)
+    // GdogTAK uses char1 for init and char2 for polling (matching Alpha's pattern)
+    const val WRITE_CHAR_UUID = "6a4e2824-667b-11e3-949a-0800200c9a66"  // PRIMARY - Init sequence (handle 0x29)
+    const val WRITE_CHAR_UUID_2 = "6a4e2821-667b-11e3-949a-0800200c9a66"  // SECONDARY - Polling/relay (handle 0x1A)
     
     // All notification characteristics to subscribe to
     val NOTIFY_CHAR_UUIDS = listOf(

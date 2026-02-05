@@ -1062,10 +1062,11 @@ class BleTrackingService : Service() {
         
         bleHandler.postDelayed({
             Log.i(TAG, ">>> DUAL INIT COMPLETE - Starting periodic polling")
-            // Start periodic polling on char1 (the main data characteristic)
-            val mainChar = writeCharacteristic
-            if (mainChar != null) {
-                startPeriodicPolling(gatt, mainChar)
+            // Start periodic polling on char2 (6a4e2821) - this is where Alpha sends 02_35 relay commands
+            // Init was on char1 (6a4e2824), but polling goes to char2 (matching Alpha app pattern)
+            val pollingChar = writeCharacteristic2 ?: writeCharacteristic
+            if (pollingChar != null) {
+                startPeriodicPolling(gatt, pollingChar)
             }
             updateStatus(Status.TRACKING, "Tracking (no 02_26, full init)")
         }, delay)
