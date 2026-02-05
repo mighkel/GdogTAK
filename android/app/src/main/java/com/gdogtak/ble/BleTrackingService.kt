@@ -99,6 +99,8 @@ class BleTrackingService : Service() {
     // Tracking stats
     private var positionCount = 0
     private var lastPosition: GarminProtocol.DogPosition? = null
+    private var notificationCount = 0
+    private var lastCollarDataTime = 0L  // Track time since last collar position
     
     // Init sequence state
     private var initSequenceStarted = false
@@ -215,6 +217,10 @@ class BleTrackingService : Service() {
         // Reset state
         initSequenceStarted = false
         positionCount = 0
+        notificationCount = 0
+        lastCollarDataTime = 0L
+        registryParsed = false
+        registeredCollars = emptyList()
         
         // Start as foreground service
         startForegroundService()
@@ -1112,6 +1118,17 @@ class BleTrackingService : Service() {
                 // Send ONE command per tick to avoid BLE write collisions.
                 // 02_35 (collar relay) is the most frequent - sent on most ticks.
                 // Alpha sends it ~3/sec (391x in working session) vs 02_11 (~10/sec).
+                // Diagnostic: warn if no collar data after 60 seconds of polling
+                if (pollingTickCount == 30 && positionCount == 0) {
+                    Log.w(TAG, ">>> DIAGNOSTIC: 60 seconds of polling, ZERO collar positions received!")
+                    Log.w(TAG, "    Notifications received: $notificationCount total")
+                    Log.w(TAG, "    Registry parsed: $registryParsed, collars: ${registeredCollars.size}")
+                    Log.w(TAG, "    Handheld position: ${handheldPosition != null}")
+                    Log.w(TAG, "    This may indicate the Alpha app was recently connected.")
+                    Log.w(TAG, "    Try: power-cycle the Alpha 300i, then start GdogTAK WITHOUT the Alpha app.")
+                    updateStatus(Status.TRACKING, "Tracking - waiting for collar data...")
+                }
+
                 try {
                     val cmdToSend: ByteArray
                     val cmdDesc: String
@@ -1153,7 +1170,13 @@ class BleTrackingService : Service() {
                         }
                     }
 
-                    Log.i(TAG, "Poll #$pollingTickCount: $cmdDesc (${cmdToSend.size}B) ${cmdToSend.copyOf(minOf(6, cmdToSend.size)).toHexString()}")
+                    // Log full relay command on first send for diagnostic verification
+                    if (pollingTickCount <= 2 && cmdDesc.contains("02_35")) {
+                        Log.i(TAG, "Poll #$pollingTickCount: $cmdDesc FULL (${cmdToSend.size}B): ${cmdToSend.toHexString()}")
+                        Log.i(TAG, "    Using ${if (registeredCollars.isNotEmpty()) "dynamic" else "hardcoded"} collar ID")
+                    } else {
+                        Log.i(TAG, "Poll #$pollingTickCount: $cmdDesc (${cmdToSend.size}B) ${cmdToSend.copyOf(minOf(6, cmdToSend.size)).toHexString()}")
+                    }
                     sendCommandLogged(g, characteristic, cmdToSend, cmdDesc)
                 } catch (e: Exception) {
                     Log.e(TAG, "Periodic polling error", e)
@@ -1313,12 +1336,22 @@ class BleTrackingService : Service() {
      * Handle incoming BLE notification with position data
      */
     private fun handleNotification(charUuid: String, data: ByteArray) {
-        // Log ALL notifications for debugging
-        Log.i(TAG, ">>> BLE NOTIFICATION received! Char: ${charUuid.takeLast(8)}, Size: ${data.size}")
-        
+        notificationCount++
+
+        // Identify notification command type for diagnostics
+        val cmdInfo = if (data.size >= 5) {
+            val hi = data[3].toInt() and 0xFF
+            val lo = data[4].toInt() and 0xFF
+            "%02X_%02X".format(hi, lo)
+        } else "tiny"
+
+        // Only log details for significant notifications (>10 bytes)
         if (data.size > 10) {
-            // Log raw hex for position packet debugging
+            Log.i(TAG, ">>> NOTIF #$notificationCount cmd=$cmdInfo size=${data.size} char=${charUuid.takeLast(8)}")
             Log.i(TAG, "Raw data: ${data.toHexString()}")
+        } else {
+            // Reduce noise: only log small ACK packets at debug level
+            Log.d(TAG, "NOTIF #$notificationCount cmd=$cmdInfo size=${data.size}")
         }
         
         // Parse channel prefix from device ID confirm response
@@ -1372,6 +1405,7 @@ class BleTrackingService : Service() {
             GarminProtocol.DeviceType.COLLAR -> {
                 positionCount++
                 lastPosition = position
+                lastCollarDataTime = System.currentTimeMillis()
 
                 Log.i(TAG, ">>> DOG POSITION #$positionCount: ${position.latitude}, ${position.longitude}")
 
