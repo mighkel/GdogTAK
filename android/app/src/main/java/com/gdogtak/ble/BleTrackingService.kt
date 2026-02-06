@@ -714,20 +714,36 @@ class BleTrackingService : Service() {
         Log.i(TAG, "  cmd1 (ID send, 12B): ${cmd1.toHexString()}")
         Log.i(TAG, "  cmd2 (ID confirm, 13B): ${cmd2.toHexString()}")
 
-        // IMPORTANT: Schedule cmd1 with a delay to ensure previous BLE operations complete
-        // Android BLE can only have one pending write at a time - synchronous calls get dropped
+        // Send cmd1 first with explicit logging to debug the issue
         bleHandler.postDelayed({
-            sendCommand(gatt, char, cmd1, "ID send")
+            Log.i(TAG, ">>> SENDING CMD1 NOW (12 bytes)")
+            try {
+                char.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    val result = gatt.writeCharacteristic(char, cmd1, BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE)
+                    Log.i(TAG, ">>> CMD1 writeCharacteristic result: $result (0=success)")
+                } else {
+                    @Suppress("DEPRECATION")
+                    char.value = cmd1
+                    @Suppress("DEPRECATION")
+                    val result = gatt.writeCharacteristic(char)
+                    Log.i(TAG, ">>> CMD1 writeCharacteristic result: $result")
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, ">>> CMD1 EXCEPTION", e)
+            }
 
+            // Send cmd2 after delay
             bleHandler.postDelayed({
+                Log.i(TAG, ">>> SENDING CMD2 NOW (13 bytes)")
                 sendCommand(gatt, char, cmd2, "ID confirm")
 
-                // Wait for response with channel prefix, then continue
+                // Wait for response, then continue
                 bleHandler.postDelayed({
                     sendInitPhase2(gatt, char, id)
-                }, 300)  // Wait for prefix response
+                }, 300)
             }, INIT_STEP_DELAY_MS)
-        }, 100)  // Small delay to let previous BLE writes complete
+        }, 200)  // 200ms delay to ensure CCCD writes complete
     }
     
     /**
