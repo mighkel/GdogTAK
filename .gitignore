@@ -25,6 +25,7 @@ venv/
 
 # Logs
 *.log
+!btsnoop*.log
 
 # Local test data (don't commit real captures with personal coordinates)
 /captures/
