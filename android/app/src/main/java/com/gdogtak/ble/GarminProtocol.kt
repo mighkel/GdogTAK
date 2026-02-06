@@ -159,7 +159,7 @@ object GarminProtocol {
      */
     private fun findDeviceMarker(data: ByteArray, marker: Byte): Boolean {
         // Search for 02 XX pattern (device type indicator)
-        val searchLimit = minOf(data.size - 2, 30)
+        val searchLimit = data.size - 2
         for (i in 0 until searchLimit) {
             if (data[i] == 0x02.toByte()) {
                 val found = data[i + 1]

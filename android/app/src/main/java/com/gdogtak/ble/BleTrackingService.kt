@@ -60,6 +60,12 @@ class BleTrackingService : Service() {
         // Init sequence timing
         private const val INIT_STEP_DELAY_MS = 150L
         private const val CCCD_WRITE_DELAY_MS = 100L
+        private const val POLL_INTERVAL_MS = 350L  // Target ~3/sec like Alpha app
+        private const val DIAG_NO_COLLAR_MS = 60_000L
+        private const val GPS_UPDATE_INTERVAL_MS = 60_000L
+        private const val POS_REQUEST_INTERVAL_MS = 30_000L
+        private const val POLL_CONFIG_INTERVAL_MS = 20_000L
+        private const val SLOT_REREG_INTERVAL_MS = 10_000L
     }
     
     // Service state
@@ -124,6 +130,12 @@ class BleTrackingService : Service() {
     private var collarSlotIndex = 0  // Cycles through 0x80-0x9E for re-registration
     private var relaySeqHi: Byte = 0x80.toByte()  // Rolling sequence for 02_35 commands
     private var relaySeqLo: Byte = 0xBF.toByte()  // Rolling counter for 02_35 commands
+    private var pollingStartMs = 0L
+    private var lastGpsUpdateMs = 0L
+    private var lastPosRequestMs = 0L
+    private var lastPollConfigMs = 0L
+    private var lastSlotReregMs = 0L
+    private var diagNoCollarLogged = false
     
     // Binder for activity communication
     private val binder = LocalBinder()
@@ -442,7 +454,7 @@ class BleTrackingService : Service() {
                     if (char.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0) append("N")
                     if (char.properties and BluetoothGattCharacteristic.PROPERTY_INDICATE != 0) append("I")
                 }
-                Log.i(TAG, "  Char: ${char.uuid.toString().takeLast(8)} instance=${char.instanceId} props=$propsStr (${char.properties})")
+                Log.i(TAG, "  Char: ${char.uuid} instance=${char.instanceId} props=$propsStr (${char.properties})")
             }
             
             // CRITICAL: Alpha writes "02 00" to handle 0x000D FIRST
@@ -458,7 +470,7 @@ class BleTrackingService : Service() {
                 if (serviceChangedChar != null) {
                     serviceChangedCccd = serviceChangedChar.getDescriptor(cccdUuid)
                     if (serviceChangedCccd != null) {
-                        Log.i(TAG, ">>> Found Service Changed CCCD in service ${svc.uuid.toString().takeLast(8)} instance=${serviceChangedChar.instanceId}")
+                        Log.i(TAG, ">>> Found Service Changed CCCD in service ${svc.uuid} instance=${serviceChangedChar.instanceId}")
                         break
                     }
                 }
@@ -496,39 +508,22 @@ class BleTrackingService : Service() {
             }
 
             // Build list of notification characteristics to subscribe to
-            // KEY INSIGHT: Alpha app only subscribes to ONE channel (0x0027 = 6a4e2814, notify channel 5)
-            // Not all 5 channels like we were doing before!
+            // Data may appear on different notify characteristics across sessions.
             cccdWriteQueue.clear()
             // cccdUuid already defined above for Service Changed
 
-            // Only subscribe to the LAST notify characteristic (6a4e2814 = channel 5)
-            // This matches Alpha app behavior observed in btsnoop
-            val notifyChannel5Uuid = UUID.fromString(GarminProtocol.NOTIFY_CHAR_UUIDS.last())  // 6a4e2814
-            val notifyChar = service.characteristics
-                .filter { it.uuid == notifyChannel5Uuid }
-                .minByOrNull { it.instanceId }
+            // Subscribe to all notify characteristics (6a4e2810-2814)
+            for (charUuid in GarminProtocol.NOTIFY_CHAR_UUIDS) {
+                val uuid = UUID.fromString(charUuid)
+                val characteristic = service.characteristics
+                    .filter { it.uuid == uuid }
+                    .minByOrNull { it.instanceId }
 
-            if (notifyChar != null) {
-                val descriptor = notifyChar.getDescriptor(cccdUuid)
-                if (descriptor != null) {
-                    cccdWriteQueue.add(descriptor)
-                    Log.i(TAG, ">>> Queued subscription for CHANNEL 5 ONLY: ${notifyChannel5Uuid.toString().takeLast(8)} instance=${notifyChar.instanceId}")
-                }
-            } else {
-                Log.w(TAG, "Notify channel 5 not found, falling back to all channels")
-                // Fallback: subscribe to all channels
-                for (charUuid in GarminProtocol.NOTIFY_CHAR_UUIDS) {
-                    val uuid = UUID.fromString(charUuid)
-                    val characteristic = service.characteristics
-                        .filter { it.uuid == uuid }
-                        .minByOrNull { it.instanceId }
-
-                    if (characteristic != null) {
-                        val descriptor = characteristic.getDescriptor(cccdUuid)
-                        if (descriptor != null) {
-                            cccdWriteQueue.add(descriptor)
-                            Log.i(TAG, "Queued subscription for: $charUuid instance=${characteristic.instanceId}")
-                        }
+                if (characteristic != null) {
+                    val descriptor = characteristic.getDescriptor(cccdUuid)
+                    if (descriptor != null) {
+                        cccdWriteQueue.add(descriptor)
+                        Log.i(TAG, "Queued subscription for: $charUuid instance=${characteristic.instanceId}")
                     }
                 }
             }
@@ -553,7 +548,7 @@ class BleTrackingService : Service() {
             descriptor: BluetoothGattDescriptor,
             status: Int
         ) {
-            val charUuid = descriptor.characteristic.uuid.toString().takeLast(8)
+            val charUuid = descriptor.characteristic.uuid.toString()
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 Log.i(TAG, ">>> CCCD written OK for: $charUuid")
             } else {
@@ -1205,6 +1200,12 @@ class BleTrackingService : Service() {
         stopPeriodicPolling()
         pollingTickCount = 0
         collarSlotIndex = 0
+        pollingStartMs = System.currentTimeMillis()
+        lastGpsUpdateMs = pollingStartMs
+        lastPosRequestMs = pollingStartMs
+        lastPollConfigMs = pollingStartMs
+        lastSlotReregMs = pollingStartMs
+        diagNoCollarLogged = false
 
         val configPrefix = (channelPrefix + 2).toByte()
         Log.i(TAG, "Polling configPrefix=0x${"%02x".format(configPrefix)} (channelPrefix=0x${"%02x".format(channelPrefix)})")
@@ -1236,9 +1237,12 @@ class BleTrackingService : Service() {
 
                 // Send ONE command per tick to avoid BLE write collisions.
                 // 02_35 (collar relay) is the most frequent - sent on most ticks.
-                // Alpha sends it ~3/sec (391x in working session) vs 02_11 (~10/sec).
+                // Alpha sends it ~3/sec (391x in working session).
                 // Diagnostic: warn if no collar data after 60 seconds of polling
-                if (pollingTickCount == 30 && positionCount == 0) {
+                val nowMs = System.currentTimeMillis()
+                if (!diagNoCollarLogged && positionCount == 0 &&
+                    nowMs - pollingStartMs >= DIAG_NO_COLLAR_MS) {
+                    diagNoCollarLogged = true
                     Log.w(TAG, ">>> DIAGNOSTIC: 60 seconds of polling, ZERO collar positions received!")
                     Log.w(TAG, "    Notifications received: $notificationCount total")
                     Log.w(TAG, "    Registry parsed: $registryParsed, collars: ${registeredCollars.size}")
@@ -1253,23 +1257,26 @@ class BleTrackingService : Service() {
                     val cmdDesc: String
 
                     when {
-                        // Every 30th tick (~1 minute): GPS update
-                        pollingTickCount % 30 == 0 -> {
+                        // GPS update (~60s)
+                        nowMs - lastGpsUpdateMs >= GPS_UPDATE_INTERVAL_MS -> {
                             cmdToSend = buildGpsUpdateCommand(configPrefix)
                             cmdDesc = "GPS update 02_37"
+                            lastGpsUpdateMs = nowMs
                         }
-                        // Every 15th tick (~30 seconds): position request
-                        pollingTickCount % 15 == 0 -> {
+                        // Position request (~30s)
+                        nowMs - lastPosRequestMs >= POS_REQUEST_INTERVAL_MS -> {
                             cmdToSend = buildPositionRequestCommand(configPrefix)
                             cmdDesc = "Pos request 02_34"
+                            lastPosRequestMs = nowMs
                         }
-                        // Every 10th tick (~20 seconds): polling config
-                        pollingTickCount % 10 == 0 -> {
+                        // Poll config (~20s)
+                        nowMs - lastPollConfigMs >= POLL_CONFIG_INTERVAL_MS -> {
                             cmdToSend = buildPollingCommand(configPrefix)
                             cmdDesc = "Poll config 02_08"
+                            lastPollConfigMs = nowMs
                         }
-                        // Every 5th tick (~10 seconds): collar slot re-registration
-                        pollingTickCount % 5 == 0 -> {
+                        // Collar slot re-registration (~10s)
+                        nowMs - lastSlotReregMs >= SLOT_REREG_INTERVAL_MS -> {
                             val slot = 0x80 + collarSlotIndex
                             val slotCmd = GarminProtocol.buildCollarSlotPacket(
                                 slot, seqHi = 0x02, seqLo = pollingTickCount and 0xFF
@@ -1281,6 +1288,7 @@ class BleTrackingService : Service() {
                             cmdToSend = prefixed
                             cmdDesc = "Re-reg slot 0x${"%02x".format(slot)}"
                             collarSlotIndex = (collarSlotIndex + 1) % 31
+                            lastSlotReregMs = nowMs
                         }
                         // All other ticks: collar relay 02_35 (the critical missing command)
                         else -> {
@@ -1301,13 +1309,13 @@ class BleTrackingService : Service() {
                     Log.e(TAG, "Periodic polling error", e)
                 }
 
-                bleHandler.postDelayed(this, 2000)  // 2-second interval (Alpha sends at ~0.3s)
+                bleHandler.postDelayed(this, POLL_INTERVAL_MS)
             }
         }
 
         // Start periodic polling 3 seconds after init burst completes
         bleHandler.postDelayed(pollingRunnable!!, 3000 + 5 * 250)
-        Log.i(TAG, "Periodic polling scheduled (2-second interval with 02_35 relay, starts after burst)")
+        Log.i(TAG, "Periodic polling scheduled (${POLL_INTERVAL_MS}ms interval with 02_35 relay, starts after burst)")
     }
 
     private fun stopPeriodicPolling() {
@@ -1466,7 +1474,7 @@ class BleTrackingService : Service() {
 
         // Only log details for significant notifications (>10 bytes)
         if (data.size > 10) {
-            Log.i(TAG, ">>> NOTIF #$notificationCount cmd=$cmdInfo size=${data.size} char=${charUuid.takeLast(8)}")
+            Log.i(TAG, ">>> NOTIF #$notificationCount cmd=$cmdInfo size=${data.size} char=$charUuid")
             Log.i(TAG, "Raw data: ${data.toHexString()}")
         } else {
             // Reduce noise: only log small ACK packets at debug level
