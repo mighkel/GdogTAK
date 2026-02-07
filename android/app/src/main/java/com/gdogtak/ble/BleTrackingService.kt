@@ -496,40 +496,29 @@ class BleTrackingService : Service() {
             }
 
             // Build list of notification characteristics to subscribe to
-            // KEY INSIGHT: Alpha app only subscribes to ONE channel (0x0027 = 6a4e2814, notify channel 5)
-            // Not all 5 channels like we were doing before!
+            // CRITICAL FIX: Subscribe to ALL notify channels (6a4e2810-2814)!
+            // Btsnoop analysis shows coordinates arrive on handle 0x0012 (channel 1) and 0x0021 (channel 4)
+            // NOT on channel 5 as previously assumed. We were missing all the data!
             cccdWriteQueue.clear()
             // cccdUuid already defined above for Service Changed
 
-            // Only subscribe to the LAST notify characteristic (6a4e2814 = channel 5)
-            // This matches Alpha app behavior observed in btsnoop
-            val notifyChannel5Uuid = UUID.fromString(GarminProtocol.NOTIFY_CHAR_UUIDS.last())  // 6a4e2814
-            val notifyChar = service.characteristics
-                .filter { it.uuid == notifyChannel5Uuid }
-                .minByOrNull { it.instanceId }
+            // Subscribe to ALL notify characteristics - don't miss any data channels!
+            Log.i(TAG, ">>> Subscribing to ALL ${GarminProtocol.NOTIFY_CHAR_UUIDS.size} notify channels")
+            for (charUuid in GarminProtocol.NOTIFY_CHAR_UUIDS) {
+                val uuid = UUID.fromString(charUuid)
+                val characteristic = service.characteristics
+                    .filter { it.uuid == uuid }
+                    .minByOrNull { it.instanceId }
 
-            if (notifyChar != null) {
-                val descriptor = notifyChar.getDescriptor(cccdUuid)
-                if (descriptor != null) {
-                    cccdWriteQueue.add(descriptor)
-                    Log.i(TAG, ">>> Queued subscription for CHANNEL 5 ONLY: ${notifyChannel5Uuid.toString().takeLast(8)} instance=${notifyChar.instanceId}")
-                }
-            } else {
-                Log.w(TAG, "Notify channel 5 not found, falling back to all channels")
-                // Fallback: subscribe to all channels
-                for (charUuid in GarminProtocol.NOTIFY_CHAR_UUIDS) {
-                    val uuid = UUID.fromString(charUuid)
-                    val characteristic = service.characteristics
-                        .filter { it.uuid == uuid }
-                        .minByOrNull { it.instanceId }
-
-                    if (characteristic != null) {
-                        val descriptor = characteristic.getDescriptor(cccdUuid)
-                        if (descriptor != null) {
-                            cccdWriteQueue.add(descriptor)
-                            Log.i(TAG, "Queued subscription for: $charUuid instance=${characteristic.instanceId}")
-                        }
+                if (characteristic != null) {
+                    val descriptor = characteristic.getDescriptor(cccdUuid)
+                    if (descriptor != null) {
+                        cccdWriteQueue.add(descriptor)
+                        // Log FULL UUID to identify active channels
+                        Log.i(TAG, ">>> Queued subscription: ${charUuid} instance=${characteristic.instanceId}")
                     }
+                } else {
+                    Log.w(TAG, "Notify characteristic not found: $charUuid")
                 }
             }
 
@@ -1301,13 +1290,13 @@ class BleTrackingService : Service() {
                     Log.e(TAG, "Periodic polling error", e)
                 }
 
-                bleHandler.postDelayed(this, 2000)  // 2-second interval (Alpha sends at ~0.3s)
+                bleHandler.postDelayed(this, 350)  // 350ms interval to match Alpha app cadence (~300-400ms)
             }
         }
 
-        // Start periodic polling 3 seconds after init burst completes
+        // Start periodic polling after init burst completes
         bleHandler.postDelayed(pollingRunnable!!, 3000 + 5 * 250)
-        Log.i(TAG, "Periodic polling scheduled (2-second interval with 02_35 relay, starts after burst)")
+        Log.i(TAG, "Periodic polling scheduled (350ms interval with 02_35 relay - matches Alpha cadence)")
     }
 
     private fun stopPeriodicPolling() {
