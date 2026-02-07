@@ -179,34 +179,45 @@ object GarminProtocol {
     }
     
     /**
-     * Find coordinate block (0A 0C 08 or 0A 0F 0A 0C 08) and decode lat/lon
-     * 
-     * Pattern variations found in btsnoop:
-     * - Direct: 0A 0C 08 [lat] 10 [lon]
-     * - Nested: 0A 2F 0A 0C 08 [lat] 10 [lon] (inside larger structure)
+     * Find coordinate block and decode lat/lon
+     *
+     * Pattern: 0A [length] 08 [lat varint] 10 [lon varint]
+     * where [length] varies (0x0C=12, 0x1A=26, etc.)
+     *
+     * The coordinate block starts with:
+     * - 0A = protobuf field 1, length-delimited
+     * - XX = length byte (varies)
+     * - 08 = field 1 (latitude), varint wire type
      */
     private fun findCoordinates(data: ByteArray): Pair<Double, Double>? {
         for (i in 0 until data.size - 15) {
-            // Look for coordinate block signature: 0A 0C 08
-            if (data[i] == 0x0A.toByte() && 
-                data[i + 1] == 0x0C.toByte() && 
+            // Look for coordinate block signature: 0A [any length] 08
+            // The length byte (data[i+1]) can vary: 0x0C (12), 0x1A (26), etc.
+            if (data[i] == 0x0A.toByte() &&
                 data[i + 2] == 0x08.toByte()) {
-                
-                android.util.Log.d("GarminProtocol", "Found 0A 0C 08 at index $i")
-                val result = tryDecodeCoordinates(data, i + 3)
-                if (result != null) return result
+
+                val lengthByte = data[i + 1].toInt() and 0xFF
+                // Sanity check: length should be reasonable (8-50 bytes for coordinates)
+                if (lengthByte in 8..50) {
+                    android.util.Log.d("GarminProtocol", "Found 0A ${"%02X".format(lengthByte)} 08 at index $i")
+                    val result = tryDecodeCoordinates(data, i + 3)
+                    if (result != null) return result
+                }
             }
-            
-            // Also check for nested pattern: 0A XX 0A 0C 08
+
+            // Also check for nested pattern: 0A XX 0A YY 08
             if (i + 4 < data.size &&
                 data[i] == 0x0A.toByte() &&
                 data[i + 2] == 0x0A.toByte() &&
-                data[i + 3] == 0x0C.toByte() &&
                 data[i + 4] == 0x08.toByte()) {
-                
-                android.util.Log.d("GarminProtocol", "Found nested 0A XX 0A 0C 08 at index $i")
-                val result = tryDecodeCoordinates(data, i + 5)
-                if (result != null) return result
+
+                val outerLen = data[i + 1].toInt() and 0xFF
+                val innerLen = data[i + 3].toInt() and 0xFF
+                if (outerLen in 8..100 && innerLen in 8..50) {
+                    android.util.Log.d("GarminProtocol", "Found nested 0A ${"%02X".format(outerLen)} 0A ${"%02X".format(innerLen)} 08 at index $i")
+                    val result = tryDecodeCoordinates(data, i + 5)
+                    if (result != null) return result
+                }
             }
         }
         android.util.Log.d("GarminProtocol", "No coordinate signature found in ${data.size} bytes")
