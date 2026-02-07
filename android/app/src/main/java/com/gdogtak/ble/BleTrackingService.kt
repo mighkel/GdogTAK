@@ -638,17 +638,19 @@ class BleTrackingService : Service() {
     /**
      * Write next CCCD in queue
      *
-     * NOTE: We do NOT call setCharacteristicNotification here!
-     * It must be called AFTER the CCCD write succeeds (in onDescriptorWrite).
-     * Some Android BLE stacks lose notification registrations if the next
-     * setCharacteristicNotification is called before the previous one completes.
+     * Call setCharacteristicNotification BEFORE the CCCD write (standard pattern).
+     * We also reinforce it AFTER success in onDescriptorWrite for compatibility
+     * with devices that need callbacks registered after the CCCD write completes.
      */
     private fun writeNextCccd(gatt: BluetoothGatt) {
         if (cccdWriteQueue.isEmpty()) return
 
         val descriptor = cccdWriteQueue.removeAt(0)
         try {
-            // Write to remote CCCD - notification will be enabled in onDescriptorWrite
+            // Enable local notification callback BEFORE CCCD write
+            gatt.setCharacteristicNotification(descriptor.characteristic, true)
+
+            // Write to remote CCCD
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 gatt.writeDescriptor(descriptor, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
             } else {
