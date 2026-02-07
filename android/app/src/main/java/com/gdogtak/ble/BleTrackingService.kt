@@ -59,7 +59,9 @@ class BleTrackingService : Service() {
         
         // Init sequence timing
         private const val INIT_STEP_DELAY_MS = 150L
-        private const val CCCD_WRITE_DELAY_MS = 100L
+        // CRITICAL: Increased delay - some Android BLE stacks lose notification registrations
+        // if the next setCharacteristicNotification is called too quickly
+        private const val CCCD_WRITE_DELAY_MS = 250L
     }
     
     // Service state
@@ -544,11 +546,21 @@ class BleTrackingService : Service() {
         ) {
             val charUuid = descriptor.characteristic.uuid.toString().takeLast(8)
             if (status == BluetoothGatt.GATT_SUCCESS) {
-                Log.i(TAG, ">>> CCCD written OK for: $charUuid")
+                // CRITICAL FIX: Enable local notifications AFTER CCCD write succeeds
+                // Some Android BLE stacks (like Motorola) lose notification registrations
+                // if setCharacteristicNotification is called before the CCCD write completes.
+                // By calling it here, we ensure each characteristic is properly registered
+                // before moving to the next one.
+                try {
+                    gatt.setCharacteristicNotification(descriptor.characteristic, true)
+                    Log.i(TAG, ">>> CCCD written OK + notification enabled for: $charUuid")
+                } catch (e: SecurityException) {
+                    Log.e(TAG, "Security exception enabling notification for $charUuid", e)
+                }
             } else {
                 Log.e(TAG, ">>> CCCD write FAILED: $status for $charUuid")
             }
-            
+
             // Write next CCCD or start init sequence
             bleHandler.postDelayed({
                 if (cccdWriteQueue.isNotEmpty()) {
@@ -597,16 +609,14 @@ class BleTrackingService : Service() {
     /**
      * Enable indications on Service Changed characteristic (write 02 00 to its CCCD)
      * This is the FIRST thing Alpha app does - writes to handle 0x000D
-     * After this write, proceed with other CCCD subscriptions
+     * After this write, onDescriptorWrite will proceed with other CCCD subscriptions
      */
     private fun enableServiceChangedIndications(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor) {
         Log.i(TAG, ">>> ENABLING SERVICE CHANGED INDICATIONS (02 00 to CCCD, handle 0x000D equivalent)")
 
         try {
-            // Enable indications on the characteristic first
-            gatt.setCharacteristicNotification(descriptor.characteristic, true)
-
             // Write ENABLE_INDICATION_VALUE (0x0002 = "02 00") to the CCCD
+            // Note: setCharacteristicNotification will be called in onDescriptorWrite after success
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 gatt.writeDescriptor(descriptor, BluetoothGattDescriptor.ENABLE_INDICATION_VALUE)
             } else {
@@ -615,18 +625,7 @@ class BleTrackingService : Service() {
                 @Suppress("DEPRECATION")
                 gatt.writeDescriptor(descriptor)
             }
-
-            // After write completes (or after delay), proceed with CCCD subscriptions
-            bleHandler.postDelayed({
-                if (cccdWriteQueue.isNotEmpty()) {
-                    updateStatus(Status.INITIALIZING, "Subscribing to ${cccdWriteQueue.size} channels...")
-                    writeNextCccd(gatt)
-                } else if (!initSequenceStarted) {
-                    Log.i(TAG, ">>> No CCCDs to write - Starting init sequence!")
-                    startInitSequence(gatt)
-                }
-            }, 500)  // Wait 500ms for Service Changed indication enable to be processed
-
+            // onDescriptorWrite callback will handle enabling notification and processing queue
         } catch (e: SecurityException) {
             Log.e(TAG, "Security exception enabling Service Changed indications", e)
             // Proceed with CCCD subscriptions anyway
@@ -638,16 +637,18 @@ class BleTrackingService : Service() {
 
     /**
      * Write next CCCD in queue
+     *
+     * NOTE: We do NOT call setCharacteristicNotification here!
+     * It must be called AFTER the CCCD write succeeds (in onDescriptorWrite).
+     * Some Android BLE stacks lose notification registrations if the next
+     * setCharacteristicNotification is called before the previous one completes.
      */
     private fun writeNextCccd(gatt: BluetoothGatt) {
         if (cccdWriteQueue.isEmpty()) return
 
         val descriptor = cccdWriteQueue.removeAt(0)
         try {
-            // Enable local notifications
-            gatt.setCharacteristicNotification(descriptor.characteristic, true)
-
-            // Write to remote CCCD
+            // Write to remote CCCD - notification will be enabled in onDescriptorWrite
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 gatt.writeDescriptor(descriptor, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
             } else {
@@ -656,7 +657,7 @@ class BleTrackingService : Service() {
                 @Suppress("DEPRECATION")
                 gatt.writeDescriptor(descriptor)
             }
-            
+
             Log.d(TAG, "Writing CCCD for: ${descriptor.characteristic.uuid}")
         } catch (e: SecurityException) {
             Log.e(TAG, "Security exception writing CCCD", e)
