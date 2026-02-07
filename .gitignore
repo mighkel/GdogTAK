@@ -30,3 +30,4 @@ venv/
 # Local test data (don't commit real captures with personal coordinates)
 /captures/
 /test-data/
+nul
