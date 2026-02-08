@@ -127,6 +127,11 @@ class BleTrackingService : Service() {
     private var collarSlotIndex = 0  // Cycles through 0x80-0x9E for re-registration
     private var relaySeqHi: Byte = 0x80.toByte()  // Rolling sequence for 02_35 commands
     private var relaySeqLo: Byte = 0xBF.toByte()  // Rolling counter for 02_35 commands
+
+    // Fragmentation state for Garmin multi-packet protocol
+    // Garmin uses fragmented messages: [0xC0+group] [0x40+frag_num] [payload...]
+    private var fragmentGroup: Int = 0  // Rotates 0-3 for first byte low nibble
+    private var fragmentSeq: Int = 0x40  // Sequence number, starts at 0x40, wraps
     
     // Binder for activity communication
     private val binder = LocalBinder()
@@ -806,83 +811,170 @@ class BleTrackingService : Service() {
             Log.e(TAG, "Command failed: $desc", e)
         }
     }
-    
+
     /**
-     * Send device registration packet
-     * Based on Alpha app protocol - NO channel prefix, just raw 02 44 format
+     * Send message using Garmin fragmented multi-packet protocol
+     *
+     * Btsnoop analysis of Garmin Explore shows device registration uses fragmentation:
+     * - Header: [0xC0+group] [sequence]
+     * - First byte: 0xC0, 0xC1, 0xC2, 0xC3 (rotates through groups)
+     * - Second byte: 0x40, 0x41, 0x42... (incrementing sequence)
+     * - Each fragment max 20 bytes (18 bytes payload after 2-byte header)
+     *
+     * Example from btsnoop (12:32):
+     *   C0 40 00 02 44 05 88 13...  (fragment 0)
+     *   C0 41 55 FF FF 13 6D 6F...  (fragment 1)
+     *   C0 42 34 31 37 44 29 08...  (fragment 2)
+     *   C0 43 6F 20 67 20 35 47...  (fragment 3)
+     *
+     * @param message The full message payload to fragment
+     * @param desc Description for logging
+     * @return Delay in ms for all fragments to complete
+     */
+    private fun sendFragmented(
+        gatt: BluetoothGatt,
+        characteristic: BluetoothGattCharacteristic,
+        message: ByteArray,
+        desc: String,
+        baseDelay: Long = 0L
+    ): Long {
+        val FRAGMENT_PAYLOAD_SIZE = 18  // 20 bytes total - 2 byte header
+        val FRAGMENT_DELAY_MS = 50L     // Delay between fragments
+
+        val numFragments = (message.size + FRAGMENT_PAYLOAD_SIZE - 1) / FRAGMENT_PAYLOAD_SIZE
+        val groupByte = (0xC0 + fragmentGroup).toByte()
+
+        Log.d(TAG, "Fragmenting $desc: ${message.size} bytes -> $numFragments fragments (group 0x${"%02x".format(groupByte)})")
+
+        for (i in 0 until numFragments) {
+            val offset = i * FRAGMENT_PAYLOAD_SIZE
+            val payloadSize = minOf(FRAGMENT_PAYLOAD_SIZE, message.size - offset)
+
+            // Build fragment: [group_byte] [sequence] [payload]
+            val fragment = ByteArray(2 + payloadSize)
+            fragment[0] = groupByte
+            fragment[1] = (fragmentSeq and 0xFF).toByte()
+            System.arraycopy(message, offset, fragment, 2, payloadSize)
+
+            val delay = baseDelay + (i * FRAGMENT_DELAY_MS)
+            val fragNum = i
+            val seqByte = fragmentSeq
+
+            bleHandler.postDelayed({
+                Log.d(TAG, ">>> FRAG $fragNum/$numFragments seq=0x${"%02x".format(seqByte)}: ${fragment.copyOf(minOf(10, fragment.size)).toHexString()}...")
+                try {
+                    characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        gatt.writeCharacteristic(characteristic, fragment, BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE)
+                    } else {
+                        @Suppress("DEPRECATION")
+                        characteristic.value = fragment
+                        @Suppress("DEPRECATION")
+                        gatt.writeCharacteristic(characteristic)
+                    }
+                } catch (e: SecurityException) {
+                    Log.e(TAG, "Fragment $fragNum failed", e)
+                }
+            }, delay)
+
+            fragmentSeq++
+            if (fragmentSeq > 0xFF) fragmentSeq = 0x40  // Wrap sequence
+        }
+
+        // Rotate to next group for next message
+        fragmentGroup = (fragmentGroup + 1) and 0x03
+
+        return baseDelay + (numFragments * FRAGMENT_DELAY_MS)
+    }
+
+    /**
+     * Send device registration using Garmin fragmented multi-packet protocol
+     *
+     * Btsnoop analysis shows Garmin Explore uses fragmentation:
+     * - Fragment header: [0xC0+group] [0x40+seq]
+     * - Payload: [00] [02 44 ...command data...]
+     * - Each fragment max 20 bytes (18 bytes payload)
+     *
+     * OLD (not working): 06 00 02 44 05 88 13... (single 52-byte packet)
+     * NEW (working):     C0 40 00 02 44 05 88... (fragmented across 4 packets)
      */
     private fun sendDeviceRegistration(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
-        Log.i(TAG, "Sending device registration (channel 0x${"%02x".format(assignedChannel)} assigned)")
-        
-        // Channel prefix for config commands = channelPrefix + 2
-        // e.g., if prefix is 0x15, config prefix is 0x17
-        val configPrefix = (channelPrefix + 2).toByte()
-        Log.d(TAG, "Config command prefix: 0x${"%02x".format(configPrefix)}")
-        
-        // Build device registration WITH channel prefix!
-        // Format: [prefix+2] 00 02 44 [params] [device_name] [manufacturer] [model]
-        val deviceRegBase = byteArrayOf(
+        Log.i(TAG, "Sending FRAGMENTED device registration (channel 0x${"%02x".format(assignedChannel)} assigned)")
+
+        // Reset fragmentation state for new init sequence
+        fragmentGroup = 0
+        fragmentSeq = 0x40
+
+        // Device registration command (02 44)
+        // Payload format: [00] [02 44] [params] [device_name] [manufacturer] [model] [terminator]
+        // The leading 00 is part of the fragmented protocol (seen in btsnoop)
+        val deviceRegPayload = byteArrayOf(
+            0x00,        // Leading byte for fragmented messages
             0x02, 0x44,  // command type
-            0x05, 0x88.toByte(), 0x13, 0xa0.toByte(), 0x13, 
-            0x02, 0x96.toByte(), 0x3c, 
-            0xff.toByte(), 0xff.toByte(), 0xff.toByte(), 0xff.toByte(), 
+            0x05, 0x88.toByte(), 0x13, 0xa0.toByte(), 0x13,
+            0x02, 0x96.toByte(), 0x3c,
             0xff.toByte(), 0xff.toByte(), 0xff.toByte(), 0xff.toByte(),
-            0xb5.toByte(), 0x55, 0xff.toByte(), 0xff.toByte(),
-            // Device name: "GdogTAK" (7 chars) - length-prefixed
-            0x07, 0x47, 0x64, 0x6f, 0x67, 0x54, 0x41, 0x4b,
-            // Manufacturer: "ATAK" (4 chars)  
-            0x04, 0x41, 0x54, 0x41, 0x4b,
-            // Model: "GdogTAK-v1" (10 chars)
-            0x0a, 0x47, 0x64, 0x6f, 0x67, 0x54, 0x41, 0x4b, 0x2d, 0x76, 0x31,
+            0xff.toByte(), 0xff.toByte(), 0xb5.toByte(), 0x55,
+            0xff.toByte(), 0xff.toByte(),
+            // Device name: "GdogTAK" (7 chars) - length-prefixed (0x13 = length prefix byte)
+            0x13,  // String length marker
+            0x47, 0x64, 0x6f, 0x67, 0x54, 0x41, 0x4b,  // "GdogTAK"
+            // Manufacturer: 0x08 prefix + "ATAK"
+            0x08, 0x41, 0x54, 0x41, 0x4b,  // "ATAK"
+            // Model: 0x10 prefix + "GdogTAK-v1"
+            0x10, 0x47, 0x64, 0x6f, 0x67, 0x54, 0x41, 0x4b, 0x2d, 0x76, 0x31,  // "GdogTAK-v1"
             // Terminator
             0x01, 0xf8.toByte(), 0xa4.toByte(), 0x00
         )
-        // Prepend channel prefix - build explicitly to avoid any array issues
-        val deviceRegPacket = ByteArray(2 + deviceRegBase.size)
-        deviceRegPacket[0] = configPrefix
-        deviceRegPacket[1] = 0x00
-        System.arraycopy(deviceRegBase, 0, deviceRegPacket, 2, deviceRegBase.size)
+
+        Log.d(TAG, "Device reg payload: ${deviceRegPayload.size} bytes, will fragment")
         
-        Log.d(TAG, "Device reg packet size: ${deviceRegPacket.size}, first 4 bytes: ${deviceRegPacket.copyOf(4).toHexString()}")
-        
-        // Config commands - all need [prefix+2] 00 header prepended
-        // Build explicitly to ensure prefix is included
-        val configCommandsBase = listOf(
+        // Config commands - raw payloads without prefix (fragmentation adds its own header)
+        // Fragmented protocol: payload starts with 0x00 then command (02 XX ...)
+        val configCommandsRaw = listOf(
             // Position subscribe: 02 09 01 04 81 ba 13 03 9d e9 00
-            byteArrayOf(0x02, 0x09, 0x01, 0x04, 
+            byteArrayOf(0x02, 0x09, 0x01, 0x04,
                 0x81.toByte(), 0xba.toByte(), 0x13, 0x03, 0x9d.toByte(), 0xe9.toByte(), 0x00),
-            // Config 0x16 - matches Alpha's registration: 02 16 06 32 80 0f 50 06 02 14 01 02 04 06 a0 20 13 1d 49 04 01 a0 47 00
+            // Config 0x16 - matches Alpha's registration
             byteArrayOf(0x02, 0x16, 0x06, 0x32,
                 0x80.toByte(), 0x0f, 0x50, 0x06, 0x02, 0x14, 0x01, 0x02, 0x04, 0x06,
-                0xa0.toByte(), 0x20, 0x13, 0x1d, 0x49, 0x04, 0x01, 0xa0.toByte(), 0x47, 0x00),
-            // Note: 02_26 "DOG LIST SYNC" was REMOVED - Alpha app does NOT send it
-            // and it was causing interference (Alpha stops receiving collar data when GdogTAK runs)
-            // Note: Collar slot registrations (02 11) will be added dynamically below
-            // 02_19 - subscription (from Alpha BR5 init, sent before collar slots)
-            byteArrayOf(0x02, 0x19, 0x04, 0x2b, 0x92.toByte(), 0x06,
-                0x01, 0x01, 0x01, 0x01, 0x02, 0x05, 0x01, 0x01, 0x02, 0x05, 0x01, 0x01,
-                0x05, 0x92.toByte(), 0x02, 0x02, 0x0a, 0x03,
-                0xfa.toByte(), 0x58, 0x00)
+                0xa0.toByte(), 0x20, 0x13, 0x1d, 0x49, 0x04, 0x01, 0xa0.toByte(), 0x47, 0x00)
         )
         
-        // Dynamically generate collar slot registrations (02 11) for slots 0x80-0x9F
-        // with computed checksums (reverse-engineered from Dec 8 btsnoop capture)
+        // Build payloads for fragmented messages - each starts with 0x00 then command
+        val allPayloads = mutableListOf<Pair<String, ByteArray>>()
+
+        // Device registration is first (most critical)
+        allPayloads.add("DeviceReg" to deviceRegPayload)
+
+        // Config commands - prepend 0x00 to each
+        for (cmd in configCommandsRaw) {
+            val payload = ByteArray(1 + cmd.size)
+            payload[0] = 0x00
+            System.arraycopy(cmd, 0, payload, 1, cmd.size)
+            allPayloads.add("Config_02_${"%02x".format(cmd[1])}" to payload)
+        }
+
+        // Collar slot registrations (02 11) - dynamically generated
         val collarSlotCommands = (0x80..0x9E).mapIndexed { index, slot ->
             val seqLo = index + 1
             GarminProtocol.buildCollarSlotPacket(slot, seqHi = 0x02, seqLo = seqLo)
         }
-        Log.d(TAG, "Generated ${collarSlotCommands.size} collar slot registrations with computed checksums")
-        
-        // Combine base config + collar slots + remaining commands
-        val remainingCommands = listOf(
-            // Enable streaming: 02 06 05 1f 82 88 d9 00
-            byteArrayOf(0x02, 0x06, 0x05, 0x1f, 
-                0x82.toByte(), 0x88.toByte(), 0xd9.toByte(), 0x00),
-            // Polling config: 02 08 04 1e 83 08 03 f1 48 00
-            byteArrayOf(0x02, 0x08, 0x04, 0x1e, 
-                0x83.toByte(), 0x08, 0x03, 0xf1.toByte(), 0x48, 0x00),
-            // Device list query: 02 52 03 2b 81...
-            byteArrayOf(0x02, 0x52, 0x03, 0x2b, 0x81.toByte(),
+        Log.d(TAG, "Generated ${collarSlotCommands.size} collar slot registrations")
+        for (cmd in collarSlotCommands) {
+            val payload = ByteArray(1 + cmd.size)
+            payload[0] = 0x00
+            System.arraycopy(cmd, 0, payload, 1, cmd.size)
+            allPayloads.add("CollarSlot" to payload)
+        }
+
+        // Enable streaming and other essential commands
+        val essentialCommands = listOf(
+            byteArrayOf(0x02, 0x06, 0x05, 0x1f,
+                0x82.toByte(), 0x88.toByte(), 0xd9.toByte(), 0x00),  // Enable streaming
+            byteArrayOf(0x02, 0x08, 0x04, 0x1e,
+                0x83.toByte(), 0x08, 0x03, 0xf1.toByte(), 0x48, 0x00),  // Polling config
+            byteArrayOf(0x02, 0x52, 0x03, 0x2b, 0x81.toByte(),  // Device list query
                 0x01, 0x01, 0x01, 0x01, 0x01, 0x02, 0x3e, 0x01, 0x01, 0x02, 0x3e,
                 0x01, 0x01, 0x32, 0x6a, 0x3c, 0x42, 0x3a, 0x0a, 0x24,
                 0x34, 0x37, 0x31, 0x65, 0x39, 0x35, 0x39, 0x30, 0x2d, 0x38, 0x36,
@@ -890,176 +982,25 @@ class BleTrackingService : Service() {
                 0x39, 0x2d, 0x35, 0x39, 0x37, 0x62, 0x36, 0x33, 0x39, 0x31, 0x38,
                 0x30, 0x39, 0x37,
                 0x6a, 0x02, 0x08, 0x02, 0x72, 0x02, 0x08, 0x05, 0xb2.toByte(), 0x01, 0x02, 0x08, 0x0a,
-                0xc2.toByte(), 0x01, 0x04, 0x08, 0x01, 0x10, 0x01, 0xfb.toByte(), 0xd3.toByte(), 0x00),
-            // Additional poll commands
-            byteArrayOf(0x02, 0x1d, 0x04, 0x2b, 0x84.toByte(),
-                0x01, 0x01, 0x01, 0x01, 0x01, 0x02, 0x09, 0x01, 0x01, 0x02, 0x09, 0x01,
-                0x01, 0x0c, 0xea.toByte(), 0x01, 0x06, 0x0a, 0x04, 0x0a, 0x02, 0x10, 0x0b,
-                0xe3.toByte(), 0x7b, 0x00),
-            byteArrayOf(0x02, 0x1d, 0x04, 0x2b, 0x85.toByte(),
-                0x02, 0x01, 0x01, 0x01, 0x01, 0x02, 0x09, 0x01, 0x01, 0x02, 0x09, 0x01,
-                0x01, 0x0c, 0xda.toByte(), 0x02, 0x06, 0x4a, 0x04, 0x32, 0x02, 0x08, 0x03,
-                0xf6.toByte(), 0x79, 0x00),
-            // GPS position command (02 37) - tells Alpha the phone's location
-            // Captured from Alpha app btsnoop: enables collar position relay
-            byteArrayOf(0x02, 0x37, 0x04, 0x2b,
-                0x88.toByte(), 0x05,                                     // sequence
-                0x01, 0x01, 0x01, 0x01,                                  // padding
-                0x02, 0x23, 0x01, 0x01, 0x02, 0x23, 0x01, 0x01,         // sub-headers
-                0x14, 0x82.toByte(), 0x02, 0x20,                         // protobuf framing
-                0x0a, 0x1e, 0x0a, 0x1a, 0x08, 0x01, 0x12, 0x12,         // coord block header
-                0x09,                                                    // lat field tag (fixed64)
-                0x12, 0x44, 0xd8.toByte(), 0x41, 0x83.toByte(), 0xb6.toByte(), 0x32, 0x12,  // lat
-                0x11,                                                    // lon field tag (fixed64)
-                0xdb.toByte(), 0xe5.toByte(), 0xa5.toByte(), 0xb7.toByte(), 0x52, 0x7b, 0x26, 0xb6.toByte(),  // lon
-                0x18, 0x02, 0x20, 0x01,                                  // trailing fields
-                0x10, 0x46, 0x71, 0x6f, 0x00),                           // checksum + terminator
-            // ==========================================
-            // Missing init commands from Alpha BR5 capture
-            // These subscription/config commands were missing from GdogTAK
-            // ==========================================
-            // 02_1a - subscription (29B body from Alpha)
-            byteArrayOf(0x02, 0x1a, 0x05, 0x2c, 0x86.toByte(), 0x93.toByte(), 0x0f,
-                0x01, 0x01, 0x01, 0x02, 0x06, 0x01, 0x01, 0x02, 0x06, 0x01, 0x01,
-                0x06, 0xda.toByte(), 0x02, 0x03, 0xaa.toByte(), 0x01, 0x03,
-                0xe7.toByte(), 0x88.toByte(), 0x00),
-            // 02_50 - map/timezone data (83B body, contains "Garmin/gmaptz.img")
-            byteArrayOf(0x02, 0x50, 0x04, 0x2b, 0x93.toByte(), 0x07,
-                0x01, 0x01, 0x01, 0x01, 0x02, 0x3c, 0x01, 0x01, 0x02, 0x3c, 0x01, 0x01,
-                0x3a, 0xda.toByte(), 0x02, 0x39, 0x1a, 0x37, 0x0a, 0x2f, 0x0a, 0x12,
-                0x09, 0xd7.toByte(), 0x37, 0xba.toByte(), 0xbd.toByte(), 0xb8.toByte(), 0x7e, 0xe7.toByte(), 0x27,
-                0x11, 0xea.toByte(), 0xd1.toByte(), 0x2f, 0x58, 0x8f.toByte(), 0xa4.toByte(), 0xf3.toByte(), 0x95.toByte(),
-                0x12, 0x15, 0x08, 0x01, 0x2a, 0x11,
-                0x47, 0x61, 0x72, 0x6d, 0x69, 0x6e, 0x2f, 0x67, 0x6d, 0x61, 0x70, 0x74, 0x7a, 0x2e, 0x69, 0x6d, 0x67,
-                0x18, 0x80.toByte(), 0xd8.toByte(), 0x2a, 0x10, 0x0e, 0x18, 0x05, 0x20, 0x0f,
-                0xa2.toByte(), 0x4d, 0x00),
-            // 02_1f - config (34B body)
-            byteArrayOf(0x02, 0x1f, 0x04, 0x2b, 0x96.toByte(), 0x08,
-                0x01, 0x01, 0x01, 0x01, 0x02, 0x0b, 0x01, 0x01, 0x02, 0x0b, 0x01, 0x01,
-                0x0e, 0xf2.toByte(), 0x01, 0x08, 0x0a, 0x06, 0x0a, 0x04, 0x08, 0x09, 0x10, 0x05,
-                0x18, 0xf9.toByte(), 0x00),
-            // 02_24 - DATA CHANNEL ENABLE (39B body) - critical "enable all" flags
-            byteArrayOf(0x02, 0x24, 0x04, 0x2b, 0x94.toByte(), 0x0a,
-                0x01, 0x01, 0x01, 0x01, 0x02, 0x10, 0x01, 0x01, 0x02, 0x10, 0x01, 0x01,
-                0x13, 0xea.toByte(), 0x01, 0x0d, 0x8a.toByte(), 0x01, 0x0a,
-                0x08, 0x01, 0x10, 0x01, 0x18, 0x01, 0x20, 0x01, 0x28, 0x01,
-                0x46, 0x79, 0x00),
-            // 02_1b - config (30B body, Alpha sends 2x)
-            byteArrayOf(0x02, 0x1b, 0x04, 0x2b, 0x95.toByte(), 0x0b,
-                0x01, 0x01, 0x01, 0x01, 0x02, 0x07, 0x01, 0x01, 0x02, 0x07, 0x01, 0x01,
-                0x0a, 0x82.toByte(), 0x02, 0x04, 0x1a, 0x02, 0x08, 0x01,
-                0x71, 0x6b, 0x00),
-            // 02_2f - GPS related (50B body)
-            byteArrayOf(0x02, 0x2f, 0x04, 0x2b, 0x99.toByte(), 0x0d,
-                0x01, 0x01, 0x01, 0x01, 0x02, 0x1b, 0x01, 0x01, 0x02, 0x1b, 0x01, 0x01,
-                0x1b, 0xda.toByte(), 0x02, 0x18, 0x6a, 0x16, 0x0a, 0x12,
-                0x09, 0xd7.toByte(), 0x37, 0xba.toByte(), 0xbd.toByte(), 0xb8.toByte(), 0x7e, 0xe7.toByte(), 0x27,
-                0x11, 0xea.toByte(), 0xd1.toByte(), 0x2f, 0x58, 0x8f.toByte(), 0xa4.toByte(), 0xf3.toByte(), 0x95.toByte(),
-                0x10, 0x03, 0x90.toByte(), 0xa2.toByte(), 0x00),
-            // 02_22 - config (37B body)
-            byteArrayOf(0x02, 0x22, 0x04, 0x2b, 0x9f.toByte(), 0x12,
-                0x01, 0x01, 0x01, 0x01, 0x02, 0x0e, 0x01, 0x01, 0x02, 0x0e, 0x01, 0x01,
-                0x11, 0x6a, 0x0c, 0x2a, 0x0a, 0x08, 0x01, 0x12, 0x02, 0x08, 0x04, 0x12, 0x02,
-                0x08, 0x03, 0xbe.toByte(), 0x3f, 0x00),
-            // 02_34 - position request (55B body)
-            byteArrayOf(0x02, 0x34, 0x04, 0x2b, 0x80.toByte(), 0x13,
-                0x01, 0x01, 0x01, 0x01, 0x02, 0x20, 0x01, 0x01, 0x02, 0x20, 0x01, 0x01,
-                0x23, 0xfa.toByte(), 0x01, 0x1d, 0x1a, 0x1b, 0x12, 0x19,
-                0xaa.toByte(), 0x06, 0x16, 0x0a, 0x14, 0x22, 0x12,
-                0x09, 0x0a, 0x41, 0x91.toByte(), 0x82.toByte(), 0x37, 0xf5.toByte(), 0x57, 0x3b,
-                0x11, 0xb0.toByte(), 0x8f.toByte(), 0xc7.toByte(), 0x79, 0xab.toByte(), 0xf8.toByte(), 0x87.toByte(), 0xb3.toByte(),
-                0x97.toByte(), 0x5d, 0x00),
-            // 02_1e - config (33B body)
-            byteArrayOf(0x02, 0x1e, 0x04, 0x2b, 0x81.toByte(), 0x14,
-                0x01, 0x01, 0x01, 0x01, 0x02, 0x0a, 0x01, 0x01, 0x02, 0x0a, 0x01, 0x01,
-                0x0d, 0xfa.toByte(), 0x01, 0x07, 0x5a, 0x05, 0x08, 0xd9.toByte(), 0x03, 0x10, 0x01,
-                0xc4.toByte(), 0x5b, 0x00),
-            // 02_2d - config (48B body)
-            byteArrayOf(0x02, 0x2d, 0x04, 0x2b, 0x82.toByte(), 0x15,
-                0x01, 0x01, 0x01, 0x01, 0x02, 0x19, 0x01, 0x01, 0x02, 0x19, 0x01, 0x01,
-                0x16, 0x6a, 0x17, 0x2a, 0x15, 0x08, 0x01, 0x12, 0x02, 0x08, 0x04, 0x12, 0x02,
-                0x08, 0x03, 0x12, 0x09, 0x08, 0x02, 0x10, 0x05, 0x1d, 0x01, 0x05,
-                0x80.toByte(), 0x3f, 0xd9.toByte(), 0xf2.toByte(), 0x00),
-            // 02_19 second instance
-            byteArrayOf(0x02, 0x19, 0x04, 0x2b, 0x9b.toByte(), 0x0e,
-                0x01, 0x01, 0x01, 0x01, 0x02, 0x05, 0x01, 0x01, 0x02, 0x05, 0x01, 0x01,
-                0x05, 0x92.toByte(), 0x02, 0x02, 0x0a, 0x03,
-                0xfa.toByte(), 0x58, 0x00),
-            // 02_50 second instance
-            byteArrayOf(0x02, 0x50, 0x04, 0x2b, 0x9c.toByte(), 0x0f,
-                0x01, 0x01, 0x01, 0x01, 0x02, 0x3c, 0x01, 0x01, 0x02, 0x3c, 0x01, 0x01,
-                0x3a, 0xda.toByte(), 0x02, 0x39, 0x1a, 0x37, 0x0a, 0x2f, 0x0a, 0x12,
-                0x09, 0xd7.toByte(), 0x37, 0xba.toByte(), 0xbd.toByte(), 0xb8.toByte(), 0x7e, 0xe7.toByte(), 0x27,
-                0x11, 0xea.toByte(), 0xd1.toByte(), 0x2f, 0x58, 0x8f.toByte(), 0xa4.toByte(), 0xf3.toByte(), 0x95.toByte(),
-                0x12, 0x15, 0x08, 0x01, 0x2a, 0x11,
-                0x47, 0x61, 0x72, 0x6d, 0x69, 0x6e, 0x2f, 0x67, 0x6d, 0x61, 0x70, 0x74, 0x7a, 0x2e, 0x69, 0x6d, 0x67,
-                0x18, 0x80.toByte(), 0xd8.toByte(), 0x2a, 0x10, 0x0e, 0x18, 0x05, 0x20, 0x0f,
-                0xa2.toByte(), 0x4d, 0x00),
-            // 02_1b second instance
-            byteArrayOf(0x02, 0x1b, 0x04, 0x2b, 0x9d.toByte(), 0x10,
-                0x01, 0x01, 0x01, 0x01, 0x02, 0x07, 0x01, 0x01, 0x02, 0x07, 0x01, 0x01,
-                0x0a, 0x82.toByte(), 0x02, 0x04, 0x1a, 0x02, 0x08, 0x01,
-                0x71, 0x6b, 0x00),
-            // 02_19 third instance
-            byteArrayOf(0x02, 0x19, 0x04, 0x2b, 0x9e.toByte(), 0x11,
-                0x01, 0x01, 0x01, 0x01, 0x02, 0x05, 0x01, 0x01, 0x02, 0x05, 0x01, 0x01,
-                0x05, 0x92.toByte(), 0x02, 0x02, 0x0a, 0x03,
-                0xfa.toByte(), 0x58, 0x00)
+                0xc2.toByte(), 0x01, 0x04, 0x08, 0x01, 0x10, 0x01, 0xfb.toByte(), 0xd3.toByte(), 0x00)
         )
-        
-        // Combine all commands: base config + collar slots + remaining
-        val allCommandsBase = configCommandsBase + collarSlotCommands + remainingCommands
-        
-        // Prepend channel prefix to all config commands - build explicitly
-        val configCommands = allCommandsBase.map { cmd ->
-            val prefixedCmd = ByteArray(2 + cmd.size)
-            prefixedCmd[0] = configPrefix
-            prefixedCmd[1] = 0x00
-            System.arraycopy(cmd, 0, prefixedCmd, 2, cmd.size)
-            prefixedCmd
+        for (cmd in essentialCommands) {
+            val payload = ByteArray(1 + cmd.size)
+            payload[0] = 0x00
+            System.arraycopy(cmd, 0, payload, 1, cmd.size)
+            allPayloads.add("Essential_02_${"%02x".format(cmd[1])}" to payload)
         }
-        
-        Log.d(TAG, "Total config commands: ${configCommands.size} (including ${collarSlotCommands.size} collar slots)")
-        Log.d(TAG, "Device registration: ${deviceRegPacket.toHexString()}")
-        Log.d(TAG, "First config cmd size: ${configCommands[0].size}, first 4 bytes: ${configCommands[0].copyOf(4).toHexString()}")
-        
+
+        Log.d(TAG, "Total payloads to send fragmented: ${allPayloads.size}")
+
         try {
             characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-            
-            // Send device registration - log exactly what we're about to write
-            Log.d(TAG, ">>> WRITING device reg (${deviceRegPacket.size} bytes): ${deviceRegPacket.copyOf(6).toHexString()}...")
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                Log.d(TAG, "Using Android 13+ write API")
-                gatt.writeCharacteristic(characteristic, deviceRegPacket, BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE)
-            } else {
-                Log.d(TAG, "Using deprecated write API")
-                @Suppress("DEPRECATION")
-                characteristic.value = deviceRegPacket
-                val charVal = characteristic.value
-                Log.d(TAG, "Char value set to (${charVal?.size} bytes): ${charVal?.copyOf(6)?.toHexString()}...")
-                @Suppress("DEPRECATION")
-                gatt.writeCharacteristic(characteristic)
-            }
-            
-            // Send config commands with delays
-            var delay = 200L
-            for (cmd in configCommands) {
-                bleHandler.postDelayed({
-                    Log.d(TAG, ">>> WRITING config (${cmd.size} bytes): ${cmd.copyOf(6).toHexString()}...")
-                    try {
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                            gatt.writeCharacteristic(characteristic, cmd, BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE)
-                        } else {
-                            @Suppress("DEPRECATION")
-                            characteristic.value = cmd
-                            @Suppress("DEPRECATION")
-                            gatt.writeCharacteristic(characteristic)
-                        }
-                    } catch (e: SecurityException) {
-                        Log.e(TAG, "Config command failed", e)
-                    }
-                }, delay)
-                delay += 200L
+
+            // Send all payloads using fragmentation
+            var delay = 0L
+            for ((name, payload) in allPayloads) {
+                delay = sendFragmented(gatt, characteristic, payload, name, delay)
+                delay += 100L  // Gap between messages
             }
             
             bleHandler.postDelayed({
