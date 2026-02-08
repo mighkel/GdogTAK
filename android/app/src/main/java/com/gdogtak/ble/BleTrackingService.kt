@@ -113,9 +113,10 @@ class BleTrackingService : Service() {
     
     // Dynamically assigned data channel from Alpha
     private var assignedChannel: Byte = 0x0f  // Default, will be updated from response
-    // Channel prefix for init commands - btsnoop shows Alpha app ALWAYS uses 0x04
-    // Previous approach of dynamic assignment was producing 0x01 which doesn't work
-    private var channelPrefix: Byte = 0x04  // Alpha uses 0x04 consistently
+    // Channel prefix for init commands - MUST use the device-assigned prefix!
+    // Btsnoop analysis shows each session gets a unique channel (e.g., 0x42, 0x47)
+    // and ALL subsequent commands must use that assigned prefix.
+    private var channelPrefix: Byte = 0x00  // Will be set from device response
 
     // Device ID for init sequence (generated once per app install)
     private var deviceId: ByteArray? = null
@@ -1467,18 +1468,20 @@ class BleTrackingService : Service() {
         
         // Parse channel prefix from device ID confirm response
         // Format: 00 01 [8-byte ID] 04 00 00 [prefix] 00 01
-        // NOTE: Btsnoop analysis shows Alpha ALWAYS uses 0x04 for channel enables,
-        // regardless of what the device response contains. Dynamic prefix caused issues
-        // (device returned 0x01 but Alpha uses 0x04), so we now hardcode 0x04.
+        // Channel prefix response handling - device assigns unique channel per session
+        // Btsnoop shows each session gets different prefix (e.g., 0x42, 0x47)
+        // MUST use this prefix for all subsequent commands to work!
         if (data.size >= 16 && data[0] == 0x00.toByte() && data[1] == 0x01.toByte()) {
-            // Check command byte at position 10
+            // Check command type byte at position 10
             val cmdByte = data[10].toInt() and 0xFF
 
             if (cmdByte == 0x04 && data.size >= 14) {
-                // Device ID confirm response - log but DON'T update channelPrefix
-                // Alpha app uses 0x04 regardless of device response
+                // Device ID confirm response - CRITICAL: use the assigned channel prefix!
+                // Btsnoop shows each session gets a unique prefix (e.g., 0x42, 0x47)
+                // and ALL subsequent commands must use that assigned prefix.
                 val devicePrefix = data[13]
-                Log.i(TAG, ">>> Device suggests prefix 0x${"%02x".format(devicePrefix)} but using hardcoded 0x04 (like Alpha)")
+                channelPrefix = devicePrefix
+                Log.i(TAG, ">>> CHANNEL PREFIX ASSIGNED: 0x${"%02x".format(channelPrefix)} - will use for all commands")
             } else if (cmdByte == 0x01 && data.size >= 14) {
                 // Channel 1 subscription response - extract assigned channel
                 val newChannel = data[13]
