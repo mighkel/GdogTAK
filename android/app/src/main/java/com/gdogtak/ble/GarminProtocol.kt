@@ -87,7 +87,7 @@ object GarminProtocol {
     
     /**
      * Parse a BLE notification and extract position if present
-     * 
+     *
      * @param data Raw bytes from BLE notification
      * @return DogPosition if valid position found, null otherwise
      */
@@ -97,40 +97,50 @@ object GarminProtocol {
             return null
         }
 
-        // Determine device type
+        // First, try to find coordinates - this is the most important check
+        // Coordinates can appear in different packet types (02_35, 02_27, 02_3C, etc.)
+        val coords = findCoordinates(data)
+
+        // Determine device type from markers
         val isCollar = isCollarMessage(data)
         val isHandheld = isHandheldMessage(data)
         val isContact = isContactMessage(data)
 
-        android.util.Log.i("GarminProtocol", "Device type: collar=$isCollar, handheld=$isHandheld, contact=$isContact")
+        // Check command type at bytes 3-4 (e.g., 02_27 for position updates)
+        val cmdHi = if (data.size > 3) data[3].toInt() and 0xFF else 0
+        val cmdLo = if (data.size > 4) data[4].toInt() and 0xFF else 0
+        val isPositionCmd = (cmdHi == 0x02 && cmdLo == 0x27)  // 02_27 = position update
+        val isCollarRelayCmd = (cmdHi == 0x02 && cmdLo == 0x3C)  // 02_3C = collar relay with coords
 
-        if (!isCollar && !isHandheld && !isContact) {
-            android.util.Log.i("GarminProtocol", "No device marker found (02 35, 02 28, or 02 33)")
-            return null
+        android.util.Log.d("GarminProtocol", "Device: collar=$isCollar, handheld=$isHandheld, contact=$isContact, posCmd=$isPositionCmd")
+
+        // If we found valid coordinates, determine the source type
+        if (coords != null) {
+            val deviceType = when {
+                isCollar -> DeviceType.COLLAR
+                isContact -> DeviceType.CONTACT
+                isHandheld -> DeviceType.HANDHELD
+                isCollarRelayCmd -> DeviceType.COLLAR  // 02_3C is collar relay
+                isPositionCmd -> DeviceType.HANDHELD   // 02_27 is usually handheld position
+                else -> DeviceType.HANDHELD  // Default to handheld for unknown
+            }
+
+            android.util.Log.i("GarminProtocol", ">>> COORDS PARSED: lat=${coords.first}, lon=${coords.second}, type=$deviceType")
+
+            return DogPosition(
+                latitude = coords.first,
+                longitude = coords.second,
+                timestamp = System.currentTimeMillis(),
+                isCollar = (deviceType == DeviceType.COLLAR),
+                deviceType = deviceType
+            )
         }
 
-        // Find and decode coordinates
-        val coords = findCoordinates(data)
-        if (coords == null) {
-            android.util.Log.i("GarminProtocol", "No coordinates found in packet")
-            return null
+        // No coordinates found - only log if this looked like it should have them
+        if (isCollar || isHandheld || isContact || isPositionCmd) {
+            android.util.Log.d("GarminProtocol", "No coordinates found in device packet")
         }
-
-        val deviceType = when {
-            isCollar -> DeviceType.COLLAR
-            isContact -> DeviceType.CONTACT
-            else -> DeviceType.HANDHELD
-        }
-
-        android.util.Log.i("GarminProtocol", ">>> COORDS PARSED: lat=${coords.first}, lon=${coords.second}, type=$deviceType")
-
-        return DogPosition(
-            latitude = coords.first,
-            longitude = coords.second,
-            timestamp = System.currentTimeMillis(),
-            isCollar = isCollar,
-            deviceType = deviceType
-        )
+        return null
     }
     
     /**
@@ -229,21 +239,30 @@ object GarminProtocol {
      */
     private fun tryDecodeCoordinates(data: ByteArray, offset: Int): Pair<Double, Double>? {
         if (offset >= data.size - 5) return null
-        
+
         // Decode latitude varint
         val (latVarint, latLen) = decodeVarint(data, offset)
         val latSigned = zigzagDecode(latVarint)
-        
+
         // Check for longitude marker (0x10)
         val lonOffset = offset + latLen
         if (lonOffset >= data.size || data[lonOffset] != 0x10.toByte()) {
             return null
         }
-        
+
         // Decode longitude varint
         val (lonVarint, _) = decodeVarint(data, lonOffset + 1)
         val lonSigned = zigzagDecode(lonVarint)
-        
+
+        // Early rejection: real GPS semicircles are large numbers (> 10 million)
+        // Small values like 7, 447, or 1 are status codes, not coordinates
+        val latAbs = if (latSigned < 0) -latSigned else latSigned
+        val lonAbs = if (lonSigned < 0) -lonSigned else lonSigned
+        if (latAbs < 10_000_000 && lonAbs < 10_000_000) {
+            android.util.Log.d("GarminProtocol", "Rejecting small semicircles: lat=$latSigned, lon=$lonSigned (not GPS)")
+            return null
+        }
+
         // Convert semicircles to degrees
         val lat = semicirclesToDegrees(latSigned)
         val lon = semicirclesToDegrees(lonSigned)
