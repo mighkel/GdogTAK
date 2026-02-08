@@ -97,22 +97,41 @@ object GarminProtocol {
             return null
         }
 
+        // CRITICAL: Strip fragment header if present
+        // Garmin sends fragmented responses with 2-byte header: [0xC0-0xFF] [sequence]
+        // The first byte >= 0xC0 indicates a fragment header
+        // 2-byte ACK/marker packets (C1 40, etc.) are already filtered by size check above
+        val payload = if ((data[0].toInt() and 0xFF) >= 0xC0 && data.size > 2) {
+            android.util.Log.d("GarminProtocol", "Stripping fragment header: ${"%02X %02X".format(data[0], data[1])}")
+            data.sliceArray(2 until data.size)
+        } else {
+            data
+        }
+
+        if (payload.size < 18) {
+            android.util.Log.d("GarminProtocol", "Payload too small after header strip: ${payload.size} bytes")
+            return null
+        }
+
         // First, try to find coordinates - this is the most important check
         // Coordinates can appear in different packet types (02_35, 02_27, 02_3C, etc.)
-        val coords = findCoordinates(data)
+        val coords = findCoordinates(payload)
 
         // Determine device type from markers
-        val isCollar = isCollarMessage(data)
-        val isHandheld = isHandheldMessage(data)
-        val isContact = isContactMessage(data)
+        val isCollar = isCollarMessage(payload)
+        val isHandheld = isHandheldMessage(payload)
+        val isContact = isContactMessage(payload)
 
-        // Check command type at bytes 3-4 (e.g., 02_27 for position updates)
-        val cmdHi = if (data.size > 3) data[3].toInt() and 0xFF else 0
-        val cmdLo = if (data.size > 4) data[4].toInt() and 0xFF else 0
+        // Check command type at bytes 1-2 (e.g., 02_27 for position updates)
+        // After header strip, format is: 00 02 XX ... where XX is command type
+        val cmdHi = if (payload.size > 1) payload[1].toInt() and 0xFF else 0
+        val cmdLo = if (payload.size > 2) payload[2].toInt() and 0xFF else 0
         val isPositionCmd = (cmdHi == 0x02 && cmdLo == 0x27)  // 02_27 = position update
         val isCollarRelayCmd = (cmdHi == 0x02 && cmdLo == 0x3C)  // 02_3C = collar relay with coords
+        val is7ACmd = (cmdHi == 0x02 && cmdLo == 0x7A)  // 02_7A = another position type
 
-        android.util.Log.d("GarminProtocol", "Device: collar=$isCollar, handheld=$isHandheld, contact=$isContact, posCmd=$isPositionCmd")
+        val cmdInfo = "%02X_%02X".format(cmdHi, cmdLo)
+        android.util.Log.d("GarminProtocol", "Cmd=$cmdInfo size=${payload.size} collar=$isCollar handheld=$isHandheld posCmd=$isPositionCmd relayCmd=$isCollarRelayCmd")
 
         // If we found valid coordinates, determine the source type
         if (coords != null) {
@@ -121,11 +140,12 @@ object GarminProtocol {
                 isContact -> DeviceType.CONTACT
                 isHandheld -> DeviceType.HANDHELD
                 isCollarRelayCmd -> DeviceType.COLLAR  // 02_3C is collar relay
+                is7ACmd -> DeviceType.COLLAR  // 02_7A also contains collar position
                 isPositionCmd -> DeviceType.HANDHELD   // 02_27 is usually handheld position
                 else -> DeviceType.HANDHELD  // Default to handheld for unknown
             }
 
-            android.util.Log.i("GarminProtocol", ">>> COORDS PARSED: lat=${coords.first}, lon=${coords.second}, type=$deviceType")
+            android.util.Log.i("GarminProtocol", ">>> COORDS PARSED: lat=${coords.first}, lon=${coords.second}, type=$deviceType, cmd=$cmdInfo")
 
             return DogPosition(
                 latitude = coords.first,
@@ -137,8 +157,8 @@ object GarminProtocol {
         }
 
         // No coordinates found - only log if this looked like it should have them
-        if (isCollar || isHandheld || isContact || isPositionCmd) {
-            android.util.Log.d("GarminProtocol", "No coordinates found in device packet")
+        if (isCollar || isHandheld || isContact || isPositionCmd || isCollarRelayCmd || is7ACmd) {
+            android.util.Log.d("GarminProtocol", "No coordinates found in $cmdInfo packet (size=${payload.size})")
         }
         return null
     }
