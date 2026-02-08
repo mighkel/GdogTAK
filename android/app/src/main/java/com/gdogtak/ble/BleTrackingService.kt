@@ -815,20 +815,21 @@ class BleTrackingService : Service() {
     /**
      * Send message using Garmin fragmented multi-packet protocol
      *
-     * Btsnoop analysis of Garmin Explore shows device registration uses fragmentation:
-     * - Header: [0xC0+group] [sequence]
-     * - First byte: 0xC0, 0xC1, 0xC2, 0xC3 (rotates through groups)
-     * - Second byte: 0x40, 0x41, 0x42... (incrementing sequence)
+     * Btsnoop analysis of Garmin Explore shows:
+     * - First: 2-byte marker [0xC0+group] [sequence] is sent
+     * - Then: fragmented data with same header prefix
      * - Each fragment max 20 bytes (18 bytes payload after 2-byte header)
      *
      * Example from btsnoop (12:32):
-     *   C0 40 00 02 44 05 88 13...  (fragment 0)
-     *   C0 41 55 FF FF 13 6D 6F...  (fragment 1)
-     *   C0 42 34 31 37 44 29 08...  (fragment 2)
-     *   C0 43 6F 20 67 20 35 47...  (fragment 3)
+     *   C0 40                       <- 2-byte marker (start of fragmented message)
+     *   C0 40 00 02 44 05 88 13...  <- fragment 0 (reuses same sequence!)
+     *   C0 41 55 FF FF 13 6D 6F...  <- fragment 1
+     *   C0 42 34 31 37 44 29 08...  <- fragment 2
+     *   C0 43 6F 20 67 20 35 47...  <- fragment 3
      *
      * @param message The full message payload to fragment
      * @param desc Description for logging
+     * @param sendMarker Whether to send 2-byte start marker (default true for large messages)
      * @return Delay in ms for all fragments to complete
      */
     private fun sendFragmented(
@@ -836,15 +837,41 @@ class BleTrackingService : Service() {
         characteristic: BluetoothGattCharacteristic,
         message: ByteArray,
         desc: String,
-        baseDelay: Long = 0L
+        baseDelay: Long = 0L,
+        sendMarker: Boolean = true
     ): Long {
         val FRAGMENT_PAYLOAD_SIZE = 18  // 20 bytes total - 2 byte header
         val FRAGMENT_DELAY_MS = 50L     // Delay between fragments
 
         val numFragments = (message.size + FRAGMENT_PAYLOAD_SIZE - 1) / FRAGMENT_PAYLOAD_SIZE
         val groupByte = (0xC0 + fragmentGroup).toByte()
+        val startSeq = fragmentSeq
 
-        Log.d(TAG, "Fragmenting $desc: ${message.size} bytes -> $numFragments fragments (group 0x${"%02x".format(groupByte)})")
+        Log.d(TAG, "Fragmenting $desc: ${message.size} bytes -> $numFragments fragments (group 0x${"%02x".format(groupByte)}, startSeq 0x${"%02x".format(startSeq)})")
+
+        var currentDelay = baseDelay
+
+        // Send 2-byte marker first if requested (Garmin does this for large messages)
+        if (sendMarker && numFragments > 1) {
+            val marker = byteArrayOf(groupByte, (startSeq and 0xFF).toByte())
+            bleHandler.postDelayed({
+                Log.d(TAG, ">>> FRAG MARKER: ${marker.toHexString()}")
+                try {
+                    characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        gatt.writeCharacteristic(characteristic, marker, BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE)
+                    } else {
+                        @Suppress("DEPRECATION")
+                        characteristic.value = marker
+                        @Suppress("DEPRECATION")
+                        gatt.writeCharacteristic(characteristic)
+                    }
+                } catch (e: SecurityException) {
+                    Log.e(TAG, "Fragment marker failed", e)
+                }
+            }, currentDelay)
+            currentDelay += FRAGMENT_DELAY_MS
+        }
 
         for (i in 0 until numFragments) {
             val offset = i * FRAGMENT_PAYLOAD_SIZE
@@ -856,7 +883,6 @@ class BleTrackingService : Service() {
             fragment[1] = (fragmentSeq and 0xFF).toByte()
             System.arraycopy(message, offset, fragment, 2, payloadSize)
 
-            val delay = baseDelay + (i * FRAGMENT_DELAY_MS)
             val fragNum = i
             val seqByte = fragmentSeq
 
@@ -875,8 +901,9 @@ class BleTrackingService : Service() {
                 } catch (e: SecurityException) {
                     Log.e(TAG, "Fragment $fragNum failed", e)
                 }
-            }, delay)
+            }, currentDelay)
 
+            currentDelay += FRAGMENT_DELAY_MS
             fragmentSeq++
             if (fragmentSeq > 0xFF) fragmentSeq = 0x40  // Wrap sequence
         }
@@ -884,7 +911,7 @@ class BleTrackingService : Service() {
         // Rotate to next group for next message
         fragmentGroup = (fragmentGroup + 1) and 0x03
 
-        return baseDelay + (numFragments * FRAGMENT_DELAY_MS)
+        return currentDelay
     }
 
     /**
@@ -942,12 +969,22 @@ class BleTrackingService : Service() {
         )
         
         // Build payloads for fragmented messages - each starts with 0x00 then command
+        // MINIMAL INIT - match Garmin's exact sequence before position data flows:
+        // 1. Device registration (02 44)
+        // 2. Position subscribe (02 09)
+        // 3. Config (02 16)
+        // 4. Device list query (02 52)
+        // 5. ONE collar slot (02 11) - just one, like Garmin!
+        // 6. Enable streaming (02 06)
+        // 7. Polling config (02 08)
+        // Position data should start flowing after these commands!
+
         val allPayloads = mutableListOf<Pair<String, ByteArray>>()
 
-        // Device registration is first (most critical)
+        // 1. Device registration
         allPayloads.add("DeviceReg" to deviceRegPayload)
 
-        // Config commands - prepend 0x00 to each
+        // 2-3. Config commands
         for (cmd in configCommandsRaw) {
             val payload = ByteArray(1 + cmd.size)
             payload[0] = 0x00
@@ -955,43 +992,46 @@ class BleTrackingService : Service() {
             allPayloads.add("Config_02_${"%02x".format(cmd[1])}" to payload)
         }
 
-        // Collar slot registrations (02 11) - dynamically generated
-        val collarSlotCommands = (0x80..0x9E).mapIndexed { index, slot ->
-            val seqLo = index + 1
-            GarminProtocol.buildCollarSlotPacket(slot, seqHi = 0x02, seqLo = seqLo)
-        }
-        Log.d(TAG, "Generated ${collarSlotCommands.size} collar slot registrations")
-        for (cmd in collarSlotCommands) {
-            val payload = ByteArray(1 + cmd.size)
-            payload[0] = 0x00
-            System.arraycopy(cmd, 0, payload, 1, cmd.size)
-            allPayloads.add("CollarSlot" to payload)
-        }
+        // 4. Device list query (must come before collar slot per btsnoop)
+        val deviceListQuery = byteArrayOf(0x02, 0x52, 0x03, 0x2b, 0x81.toByte(),
+            0x01, 0x01, 0x01, 0x01, 0x01, 0x02, 0x3e, 0x01, 0x01, 0x02, 0x3e,
+            0x01, 0x01, 0x32, 0x6a, 0x3c, 0x42, 0x3a, 0x0a, 0x24,
+            0x34, 0x37, 0x31, 0x65, 0x39, 0x35, 0x39, 0x30, 0x2d, 0x38, 0x36,
+            0x39, 0x36, 0x2d, 0x34, 0x61, 0x31, 0x39, 0x2d, 0x39, 0x64, 0x31,
+            0x39, 0x2d, 0x35, 0x39, 0x37, 0x62, 0x36, 0x33, 0x39, 0x31, 0x38,
+            0x30, 0x39, 0x37,
+            0x6a, 0x02, 0x08, 0x02, 0x72, 0x02, 0x08, 0x05, 0xb2.toByte(), 0x01, 0x02, 0x08, 0x0a,
+            0xc2.toByte(), 0x01, 0x04, 0x08, 0x01, 0x10, 0x01, 0xfb.toByte(), 0xd3.toByte(), 0x00)
+        val dlPayload = ByteArray(1 + deviceListQuery.size)
+        dlPayload[0] = 0x00
+        System.arraycopy(deviceListQuery, 0, dlPayload, 1, deviceListQuery.size)
+        allPayloads.add("DeviceList_02_52" to dlPayload)
 
-        // Enable streaming and other essential commands
-        val essentialCommands = listOf(
-            byteArrayOf(0x02, 0x06, 0x05, 0x1f,
-                0x82.toByte(), 0x88.toByte(), 0xd9.toByte(), 0x00),  // Enable streaming
-            byteArrayOf(0x02, 0x08, 0x04, 0x1e,
-                0x83.toByte(), 0x08, 0x03, 0xf1.toByte(), 0x48, 0x00),  // Polling config
-            byteArrayOf(0x02, 0x52, 0x03, 0x2b, 0x81.toByte(),  // Device list query
-                0x01, 0x01, 0x01, 0x01, 0x01, 0x02, 0x3e, 0x01, 0x01, 0x02, 0x3e,
-                0x01, 0x01, 0x32, 0x6a, 0x3c, 0x42, 0x3a, 0x0a, 0x24,
-                0x34, 0x37, 0x31, 0x65, 0x39, 0x35, 0x39, 0x30, 0x2d, 0x38, 0x36,
-                0x39, 0x36, 0x2d, 0x34, 0x61, 0x31, 0x39, 0x2d, 0x39, 0x64, 0x31,
-                0x39, 0x2d, 0x35, 0x39, 0x37, 0x62, 0x36, 0x33, 0x39, 0x31, 0x38,
-                0x30, 0x39, 0x37,
-                0x6a, 0x02, 0x08, 0x02, 0x72, 0x02, 0x08, 0x05, 0xb2.toByte(), 0x01, 0x02, 0x08, 0x0a,
-                0xc2.toByte(), 0x01, 0x04, 0x08, 0x01, 0x10, 0x01, 0xfb.toByte(), 0xd3.toByte(), 0x00)
-        )
-        for (cmd in essentialCommands) {
-            val payload = ByteArray(1 + cmd.size)
-            payload[0] = 0x00
-            System.arraycopy(cmd, 0, payload, 1, cmd.size)
-            allPayloads.add("Essential_02_${"%02x".format(cmd[1])}" to payload)
-        }
+        // 5. ONE collar slot registration (slot 0x82 like Garmin)
+        // Garmin sends: 02 11 01 04 82 B4 13 01 01 01 01 01 01 01 01 03 [checksum]
+        val singleCollarSlot = GarminProtocol.buildCollarSlotPacket(0x82, seqHi = 0x01, seqLo = 0x01)
+        val csPayload = ByteArray(1 + singleCollarSlot.size)
+        csPayload[0] = 0x00
+        System.arraycopy(singleCollarSlot, 0, csPayload, 1, singleCollarSlot.size)
+        allPayloads.add("CollarSlot_0x82" to csPayload)
 
-        Log.d(TAG, "Total payloads to send fragmented: ${allPayloads.size}")
+        // 6. Enable streaming (02 06)
+        val enableStreaming = byteArrayOf(0x02, 0x06, 0x05, 0x1f,
+            0x82.toByte(), 0x88.toByte(), 0xd9.toByte(), 0x00)
+        val esPayload = ByteArray(1 + enableStreaming.size)
+        esPayload[0] = 0x00
+        System.arraycopy(enableStreaming, 0, esPayload, 1, enableStreaming.size)
+        allPayloads.add("EnableStreaming_02_06" to esPayload)
+
+        // 7. Polling config (02 08)
+        val pollingConfig = byteArrayOf(0x02, 0x08, 0x04, 0x1e,
+            0x83.toByte(), 0x08, 0x03, 0xf1.toByte(), 0x48, 0x00)
+        val pcPayload = ByteArray(1 + pollingConfig.size)
+        pcPayload[0] = 0x00
+        System.arraycopy(pollingConfig, 0, pcPayload, 1, pollingConfig.size)
+        allPayloads.add("PollingConfig_02_08" to pcPayload)
+
+        Log.d(TAG, "MINIMAL INIT: ${allPayloads.size} payloads (matching Garmin sequence)")
 
         try {
             characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
