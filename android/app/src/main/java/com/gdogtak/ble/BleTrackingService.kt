@@ -129,9 +129,17 @@ class BleTrackingService : Service() {
     private var relaySeqLo: Byte = 0xBF.toByte()  // Rolling counter for 02_35 commands
 
     // Fragmentation state for Garmin multi-packet protocol
-    // Garmin uses fragmented messages: [0xC0+group] [0x40+frag_num] [payload...]
+    // CRITICAL: The fragment base is NOT always 0xC0! It's session-specific and MUST be
+    // learned from the device's first notification. Garmin Explore mirrors the device's
+    // fragment base for all outgoing writes. Using wrong base = device rejects all commands.
+    // Example: device sends A0 → phone must use A0/A1/A2/A3, NOT C0/C1/C2/C3!
+    private var fragmentBase: Int = 0xC0  // Learned from device notification (fallback 0xC0)
+    private var fragmentBaseLearned = false
     private var fragmentGroup: Int = 0  // Rotates 0-3 for first byte low nibble
     private var fragmentSeq: Int = 0x40  // Sequence number, starts at 0x40, wraps
+
+    // Negotiated MTU - default 23, request 232 for single-write commands
+    private var negotiatedMtu: Int = 23
     
     // Binder for activity communication
     private val binder = LocalBinder()
@@ -232,6 +240,9 @@ class BleTrackingService : Service() {
         lastCollarDataTime = 0L
         registryParsed = false
         registeredCollars = emptyList()
+        fragmentBaseLearned = false
+        fragmentBase = 0xC0
+        negotiatedMtu = 23
         
         // Start as foreground service
         startForegroundService()
@@ -381,12 +392,18 @@ class BleTrackingService : Service() {
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> {
-                    Log.i(TAG, "Connected to GATT server")
-                    updateStatus(Status.CONNECTED, "Connected, discovering services...")
+                    Log.i(TAG, "Connected to GATT server, requesting MTU 232")
+                    updateStatus(Status.CONNECTED, "Connected, negotiating MTU...")
                     try {
-                        gatt.discoverServices()
+                        // Request large MTU BEFORE service discovery
+                        // Garmin Explore uses MTU=232 for single-write commands
+                        if (!gatt.requestMtu(232)) {
+                            Log.w(TAG, "MTU request failed, proceeding with service discovery")
+                            gatt.discoverServices()
+                        }
                     } catch (e: SecurityException) {
-                        Log.e(TAG, "Security exception discovering services", e)
+                        Log.e(TAG, "Security exception requesting MTU", e)
+                        try { gatt.discoverServices() } catch (_: SecurityException) {}
                     }
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
@@ -402,6 +419,17 @@ class BleTrackingService : Service() {
             }
         }
         
+        override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
+            negotiatedMtu = mtu
+            Log.i(TAG, ">>> MTU negotiated: $mtu (status=$status)")
+            updateStatus(Status.CONNECTED, "Connected (MTU=$mtu), discovering services...")
+            try {
+                gatt.discoverServices()
+            } catch (e: SecurityException) {
+                Log.e(TAG, "Security exception discovering services", e)
+            }
+        }
+
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
             if (status != BluetoothGatt.GATT_SUCCESS) {
                 Log.e(TAG, "Service discovery failed: $status")
@@ -840,14 +868,49 @@ class BleTrackingService : Service() {
         baseDelay: Long = 0L,
         sendMarker: Boolean = true
     ): Long {
+        // Use learned fragment base (from device notification) instead of hardcoded 0xC0
+        val groupByte = (fragmentBase + fragmentGroup).toByte()
+        val maxPayload = negotiatedMtu - 3  // ATT header overhead
+
+        // OPTIMIZATION: With high MTU (232), send as single write like Garmin Explore does
+        if (message.size + 2 <= maxPayload) {
+            val fullMessage = ByteArray(2 + message.size)
+            fullMessage[0] = groupByte
+            fullMessage[1] = (fragmentSeq and 0xFF).toByte()
+            System.arraycopy(message, 0, fullMessage, 2, message.size)
+
+            Log.d(TAG, ">>> SINGLE WRITE $desc: ${fullMessage.size}B group=0x${"%02x".format(groupByte)} seq=0x${"%02x".format(fragmentSeq)} (MTU=$negotiatedMtu)")
+
+            bleHandler.postDelayed({
+                try {
+                    characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        gatt.writeCharacteristic(characteristic, fullMessage, BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE)
+                    } else {
+                        @Suppress("DEPRECATION")
+                        characteristic.value = fullMessage
+                        @Suppress("DEPRECATION")
+                        gatt.writeCharacteristic(characteristic)
+                    }
+                } catch (e: SecurityException) {
+                    Log.e(TAG, "Single write failed for $desc", e)
+                }
+            }, baseDelay)
+
+            fragmentSeq++
+            if (fragmentSeq > 0xFF) fragmentSeq = 0x40
+            fragmentGroup = (fragmentGroup + 1) and 0x03
+            return baseDelay + 50L
+        }
+
+        // Fallback: fragment into 20-byte chunks (default MTU=23)
         val FRAGMENT_PAYLOAD_SIZE = 18  // 20 bytes total - 2 byte header
         val FRAGMENT_DELAY_MS = 50L     // Delay between fragments
 
         val numFragments = (message.size + FRAGMENT_PAYLOAD_SIZE - 1) / FRAGMENT_PAYLOAD_SIZE
-        val groupByte = (0xC0 + fragmentGroup).toByte()
         val startSeq = fragmentSeq
 
-        Log.d(TAG, "Fragmenting $desc: ${message.size} bytes -> $numFragments fragments (group 0x${"%02x".format(groupByte)}, startSeq 0x${"%02x".format(startSeq)})")
+        Log.d(TAG, "Fragmenting $desc: ${message.size} bytes -> $numFragments fragments (group 0x${"%02x".format(groupByte)}, startSeq 0x${"%02x".format(startSeq)}, fragmentBase=0x${"%02x".format(fragmentBase)})")
 
         var currentDelay = baseDelay
 
@@ -933,8 +996,9 @@ class BleTrackingService : Service() {
         fragmentSeq = 0x40
 
         // Device registration command (02 44)
-        // Payload format: [00] [02 44] [params] [device_name] [manufacturer] [model] [terminator]
-        // The leading 00 is part of the fragmented protocol (seen in btsnoop)
+        // Payload format: [00] [02 44] [params] [len][name] [len][mfg] [len][model] [01] [CRC_HI] [CRC_LO] [00]
+        // CRC computed with Garmin CRC-16 (poly=0x0241, init=0xA2E5) over bytes 02..01
+        // Length prefix bytes MUST match actual string lengths!
         val deviceRegPayload = byteArrayOf(
             0x00,        // Leading byte for fragmented messages
             0x02, 0x44,  // command type
@@ -943,15 +1007,15 @@ class BleTrackingService : Service() {
             0xff.toByte(), 0xff.toByte(), 0xff.toByte(), 0xff.toByte(),
             0xff.toByte(), 0xff.toByte(), 0xb5.toByte(), 0x55,
             0xff.toByte(), 0xff.toByte(),
-            // Device name: "GdogTAK" (7 chars) - length-prefixed (0x13 = length prefix byte)
-            0x13,  // String length marker
+            // Device name: "GdogTAK" (7 chars) - length prefix = 0x07
+            0x07,
             0x47, 0x64, 0x6f, 0x67, 0x54, 0x41, 0x4b,  // "GdogTAK"
-            // Manufacturer: 0x08 prefix + "ATAK"
-            0x08, 0x41, 0x54, 0x41, 0x4b,  // "ATAK"
-            // Model: 0x10 prefix + "GdogTAK-v1"
-            0x10, 0x47, 0x64, 0x6f, 0x67, 0x54, 0x41, 0x4b, 0x2d, 0x76, 0x31,  // "GdogTAK-v1"
-            // Terminator
-            0x01, 0xf8.toByte(), 0xa4.toByte(), 0x00
+            // Manufacturer: "ATAK" (4 chars) - length prefix = 0x04
+            0x04, 0x41, 0x54, 0x41, 0x4b,  // "ATAK"
+            // Model: "GdogTAK-v1" (10 chars) - length prefix = 0x0A
+            0x0a, 0x47, 0x64, 0x6f, 0x67, 0x54, 0x41, 0x4b, 0x2d, 0x76, 0x31,  // "GdogTAK-v1"
+            // Terminator + CRC (Garmin CRC-16: poly=0x0241, init=0xA2E5) + end
+            0x01, 0x40, 0xe8.toByte(), 0x00
         )
 
         Log.d(TAG, "Device reg payload: ${deviceRegPayload.size} bytes, will fragment")
@@ -1161,17 +1225,17 @@ class BleTrackingService : Service() {
         // Step 5: Start streaming
         commands.add(byteArrayOf(0x00, 0x00, 0x00))
         
-        // Step 6: Device registration (no prefix)
+        // Step 6: Device registration (no prefix) - NOTE: this function is not currently called
         commands.add(byteArrayOf(
-            0x02, 0x44, 0x05, 0x88.toByte(), 0x13, 0xa0.toByte(), 0x13, 
+            0x02, 0x44, 0x05, 0x88.toByte(), 0x13, 0xa0.toByte(), 0x13,
             0x02, 0x96.toByte(), 0x3c,
             0xff.toByte(), 0xff.toByte(), 0xff.toByte(), 0xff.toByte(),
-            0xff.toByte(), 0xff.toByte(), 0xff.toByte(), 0xff.toByte(),
-            0xb5.toByte(), 0x55, 0xff.toByte(), 0xff.toByte(),
+            0xff.toByte(), 0xff.toByte(), 0xb5.toByte(), 0x55,
+            0xff.toByte(), 0xff.toByte(),
             0x07, 0x47, 0x64, 0x6f, 0x67, 0x54, 0x41, 0x4b,  // "GdogTAK"
             0x04, 0x41, 0x54, 0x41, 0x4b,  // "ATAK"
             0x0a, 0x47, 0x64, 0x6f, 0x67, 0x54, 0x41, 0x4b, 0x2d, 0x76, 0x31,  // "GdogTAK-v1"
-            0x01, 0xf8.toByte(), 0xa4.toByte(), 0x00
+            0x01, 0x40, 0xe8.toByte(), 0x00  // CRC=40E8 (Garmin CRC-16, poly=0x0241, init=0xA2E5)
         ))
         
         // Step 7: Config commands
@@ -1561,6 +1625,19 @@ class BleTrackingService : Service() {
      */
     private fun handleNotification(charUuid: String, data: ByteArray) {
         notificationCount++
+
+        // CRITICAL: Learn fragment base from device's first notification
+        // Device notifications start with a high byte (>=0x80) that encodes the fragment group.
+        // Garmin Explore mirrors this base for ALL outgoing fragmented writes.
+        // Example: if device sends A0, we must use A0/A1/A2/A3 (NOT hardcoded C0!)
+        if (!fragmentBaseLearned && data.size >= 3) {
+            val firstByte = data[0].toInt() and 0xFF
+            if (firstByte in 0x80..0xEF) {
+                fragmentBase = firstByte and 0xF0
+                fragmentBaseLearned = true
+                Log.i(TAG, ">>> FRAGMENT BASE LEARNED: 0x${"%02X".format(fragmentBase)} (from notification byte 0x${"%02X".format(firstByte)})")
+            }
+        }
 
         // Identify notification command type for diagnostics
         val cmdInfo = if (data.size >= 5) {

@@ -98,10 +98,11 @@ object GarminProtocol {
         }
 
         // CRITICAL: Strip fragment header if present
-        // Garmin sends fragmented responses with 2-byte header: [0xC0-0xFF] [sequence]
-        // The first byte >= 0xC0 indicates a fragment header
-        // 2-byte ACK/marker packets (C1 40, etc.) are already filtered by size check above
-        val payload = if ((data[0].toInt() and 0xFF) >= 0xC0 && data.size > 2) {
+        // Garmin sends notifications with 2-byte fragment header: [base+group] [sequence]
+        // The fragment base is session-specific (e.g., A0, B0, C0) - NOT always 0xC0!
+        // Any first byte >= 0x80 indicates a fragment header. Normal data starts with 0x00.
+        // 2-byte ACK/marker packets are already filtered by size check above.
+        val payload = if ((data[0].toInt() and 0xFF) >= 0x80 && data.size > 2) {
             android.util.Log.d("GarminProtocol", "Stripping fragment header: ${"%02X %02X".format(data[0], data[1])}")
             data.sliceArray(2 until data.size)
         } else {
@@ -388,6 +389,34 @@ object GarminProtocol {
         return data.size > 50 &&
                data[3] == 0x07.toByte() &&
                data[4] == 0x16.toByte()
+    }
+
+    /**
+     * Compute Garmin CRC-16 checksum.
+     *
+     * Reverse-engineered polynomial: 0x0241 (x^16 + x^9 + x^6 + 1)
+     * The initial value varies by command type:
+     *   02_11 (collar slot): init = 0x9CB3
+     *   02_44 (device registration): init = 0xA2E5
+     *
+     * @param data The message bytes to compute CRC over
+     * @param init Initial CRC value (command-type specific)
+     * @return The 16-bit CRC value (big-endian: high byte first)
+     */
+    fun garminCrc16(data: ByteArray, init: Int = 0, poly: Int = 0x0241): Int {
+        var crc = init
+        for (byte in data) {
+            val b = byte.toInt() and 0xFF
+            for (bit in 7 downTo 0) {
+                val dataBit = (b shr bit) and 1
+                val msbBit = (crc shr 15) and 1
+                crc = (crc shl 1) and 0xFFFF
+                if ((msbBit xor dataBit) != 0) {
+                    crc = crc xor poly
+                }
+            }
+        }
+        return crc
     }
 
     /**
