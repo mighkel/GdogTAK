@@ -27,7 +27,8 @@
       "Bash(cmd /c \"set JAVA_HOME=C:\\\\Program Files\\\\Android\\\\Android Studio\\\\jbr && cd /d c:\\\\Users\\\\PNADMIN\\\\Documents\\\\GitHub\\\\GdogTAK\\\\android && gradlew.bat assembleDebug\")",
       "Bash(iconv:*)",
       "Bash(export JAVA_HOME=\"/c/Program Files/Android/Android Studio/jbr\")",
-      "Bash(./gradlew assembleDebug:*)"
+      "Bash(./gradlew assembleDebug:*)",
+      "Bash(JAVA_HOME=\"/c/Program Files/Android/Android Studio/jbr\" ./gradlew:*)"
     ]
   }
 }

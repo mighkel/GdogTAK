@@ -1019,9 +1019,39 @@ class BleTrackingService : Service() {
         // Garmin Explore sends these after collar slots to request position data.
         // Format: 00 02 1D 04 2B [seq] [slot] 01 01 01 01 02 09 01 01 02 09 01
         // Without these, the Alpha doesn't send 02_3C/02_7A position data!
-        val posQuerySlots = listOf(0x01, 0x02, 0x03)  // Query first 3 collar slots
-        for ((idx, slot) in posQuerySlots.withIndex()) {
-            val seqByte = 0x84 + idx  // 84, 85, 86...
+
+        // First: Send 02 1D 04 2B for slot 0x01
+        val posQuery1 = byteArrayOf(
+            0x02, 0x1D, 0x04, 0x2B,
+            0x84.toByte(), 0x01,  // seq=84, slot=01
+            0x01, 0x01, 0x01, 0x01,
+            0x02, 0x09, 0x01, 0x01, 0x02, 0x09, 0x01
+        )
+        val pq1Payload = ByteArray(1 + posQuery1.size)
+        pq1Payload[0] = 0x00
+        System.arraycopy(posQuery1, 0, pq1Payload, 1, posQuery1.size)
+        allPayloads.add("PosQuery_02_1D_slot01" to pq1Payload)
+
+        // CRITICAL: Send 02 1D 01 04 variant - "position subscription" command!
+        // Garmin Explore sends this BETWEEN the first and second slot queries.
+        // Without this, the Alpha may not stream position data!
+        // Observed in btsnoop: 02 1D 01 04 83 BC 13 0D BB A2 14 06 C3 98 EB 43 90 9D FF FF 01...
+        val posSubscribe = byteArrayOf(
+            0x02, 0x1D, 0x01, 0x04,
+            0x83.toByte(), 0xBC.toByte(), 0x13,  // Identifier/timestamp
+            0x0D, 0xBB.toByte(), 0xA2.toByte(), 0x14,  // Position data or parameters
+            0x06, 0xC3.toByte(), 0x98.toByte(), 0xEB.toByte(),
+            0x43, 0x90.toByte(), 0x9D.toByte(), 0xFF.toByte(), 0xFF.toByte(),
+            0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x03
+        )
+        val psPayload = ByteArray(1 + posSubscribe.size)
+        psPayload[0] = 0x00
+        System.arraycopy(posSubscribe, 0, psPayload, 1, posSubscribe.size)
+        allPayloads.add("PosSubscribe_02_1D_01_04" to psPayload)
+
+        // Then: Send 02 1D 04 2B for slots 0x02 and 0x03
+        for ((idx, slot) in listOf(0x02, 0x03).withIndex()) {
+            val seqByte = 0x85 + idx  // 85, 86
             val posQueryCmd = byteArrayOf(
                 0x02, 0x1D, 0x04, 0x2B,
                 seqByte.toByte(),
@@ -1065,18 +1095,14 @@ class BleTrackingService : Service() {
             
             bleHandler.postDelayed({
                 Log.i(TAG, "Init sequence on char1 complete!")
-                
-                // Now do second init on characteristic 2 (6a4e2820)
-                // Alpha app inits on BOTH characteristics!
-                val writeChar2 = writeCharacteristic2
-                if (writeChar2 != null) {
-                    Log.i(TAG, "Starting second init on ${GarminProtocol.WRITE_CHAR_UUID_2}")
-                    startSecondInit(gatt, writeChar2)
-                } else {
-                    Log.w(TAG, "Second write characteristic not available, skipping")
-                    startPeriodicPolling(gatt, characteristic)
-                    updateStatus(Status.TRACKING, "Tracking active (standalone)")
-                }
+
+                // CRITICAL: Garmin Explore does ALL init and initial polling on char1 (0x0029).
+                // It doesn't touch char2 (0x001A) until 4+ minutes AFTER position data is flowing!
+                // Previously we were starting second init on char2 immediately - this was wrong.
+                // Now we skip second init entirely and poll on char1 like Garmin does.
+                Log.i(TAG, "Starting polling on char1 (matching Garmin Explore behavior)")
+                startPeriodicPolling(gatt, characteristic)
+                updateStatus(Status.TRACKING, "Tracking active")
             }, delay)
             
         } catch (e: SecurityException) {
