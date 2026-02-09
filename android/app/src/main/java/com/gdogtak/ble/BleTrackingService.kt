@@ -1015,6 +1015,26 @@ class BleTrackingService : Service() {
         System.arraycopy(singleCollarSlot, 0, csPayload, 1, singleCollarSlot.size)
         allPayloads.add("CollarSlot_0x82" to csPayload)
 
+        // 5b. Position query commands (02 1D) - CRITICAL for position streaming!
+        // Garmin Explore sends these after collar slots to request position data.
+        // Format: 00 02 1D 04 2B [seq] [slot] 01 01 01 01 02 09 01 01 02 09 01
+        // Without these, the Alpha doesn't send 02_3C/02_7A position data!
+        val posQuerySlots = listOf(0x01, 0x02, 0x03)  // Query first 3 collar slots
+        for ((idx, slot) in posQuerySlots.withIndex()) {
+            val seqByte = 0x84 + idx  // 84, 85, 86...
+            val posQueryCmd = byteArrayOf(
+                0x02, 0x1D, 0x04, 0x2B,
+                seqByte.toByte(),
+                slot.toByte(),
+                0x01, 0x01, 0x01, 0x01,
+                0x02, 0x09, 0x01, 0x01, 0x02, 0x09, 0x01
+            )
+            val pqPayload = ByteArray(1 + posQueryCmd.size)
+            pqPayload[0] = 0x00
+            System.arraycopy(posQueryCmd, 0, pqPayload, 1, posQueryCmd.size)
+            allPayloads.add("PosQuery_02_1D_slot${"%02x".format(slot)}" to pqPayload)
+        }
+
         // 6. Enable streaming (02 06)
         val enableStreaming = byteArrayOf(0x02, 0x06, 0x05, 0x1f,
             0x82.toByte(), 0x88.toByte(), 0xd9.toByte(), 0x00)
@@ -1199,6 +1219,32 @@ class BleTrackingService : Service() {
             }, (i * 250).toLong())
         }
 
+        // After 02_08 burst, send 02_1D position query burst - CRITICAL for position streaming!
+        // Garmin Explore sends these during init; without them, no 02_3C/02_7A position data flows.
+        val posQuerySlots = listOf(0x01, 0x02, 0x03)
+        Log.i(TAG, "Sending 02_1D position query burst (${posQuerySlots.size} commands)")
+        for ((idx, slot) in posQuerySlots.withIndex()) {
+            bleHandler.postDelayed({
+                val g = bluetoothGatt
+                if (g == null) {
+                    Log.e(TAG, "PosQuery ${idx + 1}: gatt is null!")
+                    return@postDelayed
+                }
+                // 02 1D 04 2B [seq] [slot] 01 01 01 01 02 09 01 01 02 09 01
+                val seqByte = (0x84 + idx).toByte()
+                val cmd = byteArrayOf(
+                    configPrefix, 0x00,
+                    0x02, 0x1D, 0x04, 0x2B,
+                    seqByte,
+                    slot.toByte(),
+                    0x01, 0x01, 0x01, 0x01,
+                    0x02, 0x09, 0x01, 0x01, 0x02, 0x09, 0x01
+                )
+                Log.i(TAG, "PosQuery ${idx + 1}/${posQuerySlots.size} slot 0x${"%02x".format(slot)}: ${cmd.toHexString()}")
+                sendCommandLogged(g, characteristic, cmd, "PosQuery slot 0x${"%02x".format(slot)}")
+            }, (5 * 250 + 500 + idx * 250).toLong())  // After 02_08 burst + 500ms gap
+        }
+
         pollingRunnable = object : Runnable {
             override fun run() {
                 val g = bluetoothGatt
@@ -1241,6 +1287,21 @@ class BleTrackingService : Service() {
                         pollingTickCount % 10 == 0 -> {
                             cmdToSend = buildPollingCommand(configPrefix)
                             cmdDesc = "Poll config 02_08"
+                        }
+                        // Every 7th tick (~14 seconds): position query 02_1D
+                        // This is CRITICAL for keeping position data flowing!
+                        pollingTickCount % 7 == 0 -> {
+                            val slot = 0x01 + (pollingTickCount / 7) % 3  // Cycle slots 01, 02, 03
+                            val seqByte = (0x90 + (pollingTickCount and 0x0F)).toByte()
+                            cmdToSend = byteArrayOf(
+                                configPrefix, 0x00,
+                                0x02, 0x1D, 0x04, 0x2B,
+                                seqByte,
+                                slot.toByte(),
+                                0x01, 0x01, 0x01, 0x01,
+                                0x02, 0x09, 0x01, 0x01, 0x02, 0x09, 0x01
+                            )
+                            cmdDesc = "Pos query 02_1D slot 0x${"%02x".format(slot)}"
                         }
                         // Every 5th tick (~10 seconds): collar slot re-registration
                         pollingTickCount % 5 == 0 -> {
