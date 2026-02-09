@@ -868,39 +868,92 @@ class BleTrackingService : Service() {
         baseDelay: Long = 0L,
         sendMarker: Boolean = true
     ): Long {
-        // Use learned fragment base (from device notification) instead of hardcoded 0xC0
-        val groupByte = (fragmentBase + fragmentGroup).toByte()
+        // CRITICAL: Always use base group (B0) for init commands - Garmin does NOT rotate groups
+        // Group rotation (B0→B1→B2→B3) was wrong; Garmin keeps ALL init on same base group
+        val baseGroupByte = fragmentBase.toByte()
         val maxPayload = negotiatedMtu - 3  // ATT header overhead
 
-        // OPTIMIZATION: With high MTU (232), send as single write like Garmin Explore does
+        // With high MTU (232), send as single write like Garmin Explore does
+        // Garmin protocol for single-fragment messages:
+        //   First message (02_44): marker [base][0x40] then data [base][0x40][payload]
+        //   Subsequent msgs: data [base][seq|0x80][payload] with final flag, NO group rotation
         if (message.size + 2 <= maxPayload) {
-            val fullMessage = ByteArray(2 + message.size)
-            fullMessage[0] = groupByte
-            fullMessage[1] = (fragmentSeq and 0xFF).toByte()
-            System.arraycopy(message, 0, fullMessage, 2, message.size)
+            if (fragmentSeq == 0x40 && sendMarker) {
+                // FIRST MESSAGE: send 2-byte marker then full data (like Garmin's 02_44)
+                val marker = byteArrayOf(baseGroupByte, 0x40)
+                val fullMessage = ByteArray(2 + message.size)
+                fullMessage[0] = baseGroupByte
+                fullMessage[1] = 0x40
+                System.arraycopy(message, 0, fullMessage, 2, message.size)
 
-            Log.d(TAG, ">>> SINGLE WRITE $desc: ${fullMessage.size}B group=0x${"%02x".format(groupByte)} seq=0x${"%02x".format(fragmentSeq)} (MTU=$negotiatedMtu)")
+                Log.i(TAG, ">>> MARKER+WRITE $desc: ${fullMessage.size}B base=0x${"%02x".format(fragmentBase)} (MTU=$negotiatedMtu)")
 
-            bleHandler.postDelayed({
-                try {
-                    characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                        gatt.writeCharacteristic(characteristic, fullMessage, BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE)
-                    } else {
-                        @Suppress("DEPRECATION")
-                        characteristic.value = fullMessage
-                        @Suppress("DEPRECATION")
-                        gatt.writeCharacteristic(characteristic)
+                bleHandler.postDelayed({
+                    try {
+                        characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                            gatt.writeCharacteristic(characteristic, marker, BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE)
+                        } else {
+                            @Suppress("DEPRECATION")
+                            characteristic.value = marker
+                            @Suppress("DEPRECATION")
+                            gatt.writeCharacteristic(characteristic)
+                        }
+                    } catch (e: SecurityException) {
+                        Log.e(TAG, "Marker write failed for $desc", e)
                     }
-                } catch (e: SecurityException) {
-                    Log.e(TAG, "Single write failed for $desc", e)
-                }
-            }, baseDelay)
+                }, baseDelay)
 
-            fragmentSeq++
-            if (fragmentSeq > 0xFF) fragmentSeq = 0x40
-            fragmentGroup = (fragmentGroup + 1) and 0x03
-            return baseDelay + 50L
+                bleHandler.postDelayed({
+                    try {
+                        characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                            gatt.writeCharacteristic(characteristic, fullMessage, BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE)
+                        } else {
+                            @Suppress("DEPRECATION")
+                            characteristic.value = fullMessage
+                            @Suppress("DEPRECATION")
+                            gatt.writeCharacteristic(characteristic)
+                        }
+                    } catch (e: SecurityException) {
+                        Log.e(TAG, "First data write failed for $desc", e)
+                    }
+                }, baseDelay + 50L)
+
+                fragmentSeq = 1  // Reset to 1 for subsequent single-fragment messages
+                // DON'T rotate group - Garmin keeps all init on base group
+                return baseDelay + 100L
+            } else {
+                // SUBSEQUENT MESSAGES: single write with FINAL FLAG (0x80), same base group
+                val seqWithFinal = ((fragmentSeq and 0x7F) or 0x80).toByte()
+                val fullMessage = ByteArray(2 + message.size)
+                fullMessage[0] = baseGroupByte
+                fullMessage[1] = seqWithFinal
+                System.arraycopy(message, 0, fullMessage, 2, message.size)
+
+                Log.i(TAG, ">>> SINGLE WRITE $desc: ${fullMessage.size}B base=0x${"%02x".format(fragmentBase)} seq=0x${"%02x".format(seqWithFinal)} (MTU=$negotiatedMtu)")
+
+                bleHandler.postDelayed({
+                    try {
+                        characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                            gatt.writeCharacteristic(characteristic, fullMessage, BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE)
+                        } else {
+                            @Suppress("DEPRECATION")
+                            characteristic.value = fullMessage
+                            @Suppress("DEPRECATION")
+                            gatt.writeCharacteristic(characteristic)
+                        }
+                    } catch (e: SecurityException) {
+                        Log.e(TAG, "Single write failed for $desc", e)
+                    }
+                }, baseDelay)
+
+                fragmentSeq++
+                if (fragmentSeq > 0x7F) fragmentSeq = 0x01  // Wrap at 0x7F (leave room for final flag)
+                // DON'T rotate group - Garmin keeps all init on base group
+                return baseDelay + 50L
+            }
         }
 
         // Fallback: fragment into 20-byte chunks (default MTU=23)
@@ -909,6 +962,8 @@ class BleTrackingService : Service() {
 
         val numFragments = (message.size + FRAGMENT_PAYLOAD_SIZE - 1) / FRAGMENT_PAYLOAD_SIZE
         val startSeq = fragmentSeq
+        // Use group rotation for multi-fragment messages (original behavior)
+        val groupByte = (fragmentBase + fragmentGroup).toByte()
 
         Log.d(TAG, "Fragmenting $desc: ${message.size} bytes -> $numFragments fragments (group 0x${"%02x".format(groupByte)}, startSeq 0x${"%02x".format(startSeq)}, fragmentBase=0x${"%02x".format(fragmentBase)})")
 
