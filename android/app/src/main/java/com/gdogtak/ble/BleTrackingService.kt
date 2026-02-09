@@ -1016,54 +1016,74 @@ class BleTrackingService : Service() {
         allPayloads.add("CollarSlot_0x82" to csPayload)
 
         // 5b. Position query commands (02 1D) - CRITICAL for position streaming!
-        // Garmin Explore sends these after collar slots to request position data.
-        // Format: 00 02 1D 04 2B [seq] [slot] 01 01 01 01 02 09 01 01 02 09 01
-        // Without these, the Alpha doesn't send 02_3C/02_7A position data!
+        // IMPORTANT: Garmin Explore sends FULL commands with protobuf continuation data + CRC.
+        // Previously we sent SHORT commands without the continuation - Alpha ignores those!
+        // Each 02_1D 04 2B command needs 31 bytes (not 17) = requires 2 BLE fragments.
+        // Using exact byte sequences captured from working Garmin Explore session.
 
-        // First: Send 02 1D 04 2B for slot 0x01
-        val posQuery1 = byteArrayOf(
+        // Slot 01: Full command with continuation + CRC (31 bytes, seq=84)
+        val posQuery1Full = byteArrayOf(
             0x02, 0x1D, 0x04, 0x2B,
             0x84.toByte(), 0x01,  // seq=84, slot=01
             0x01, 0x01, 0x01, 0x01,
-            0x02, 0x09, 0x01, 0x01, 0x02, 0x09, 0x01
+            0x02, 0x09, 0x01, 0x01, 0x02, 0x09, 0x01,
+            // Continuation: protobuf subscription params + CRC + terminator
+            0x01, 0x0C, 0xEA.toByte(), 0x01, 0x06, 0x0A, 0x04, 0x0A, 0x02, 0x10, 0x0B,
+            0xE3.toByte(), 0x7B, 0x00  // CRC=E37B, terminator=00
         )
-        val pq1Payload = ByteArray(1 + posQuery1.size)
+        val pq1Payload = ByteArray(1 + posQuery1Full.size)
         pq1Payload[0] = 0x00
-        System.arraycopy(posQuery1, 0, pq1Payload, 1, posQuery1.size)
-        allPayloads.add("PosQuery_02_1D_slot01" to pq1Payload)
+        System.arraycopy(posQuery1Full, 0, pq1Payload, 1, posQuery1Full.size)
+        allPayloads.add("PosQuery_02_1D_slot01_FULL" to pq1Payload)
 
-        // CRITICAL: Send 02 1D 01 04 variant - "position subscription" command!
-        // Garmin Explore sends this BETWEEN the first and second slot queries.
-        // Without this, the Alpha may not stream position data!
-        // Observed in btsnoop: 02 1D 01 04 83 BC 13 0D BB A2 14 06 C3 98 EB 43 90 9D FF FF 01...
-        val posSubscribe = byteArrayOf(
+        // 02 1D 01 04 variant - position subscription (from Garmin btsnoop)
+        // Full assembled: 02 1D 01 04 83 BC 13 0D BB A2 14 06 C3 98 EB 43 90
+        //                  90 9D FF FF 01 01 01 01 01 01 01 03 E5 71 00
+        val posSubscribeFull = byteArrayOf(
             0x02, 0x1D, 0x01, 0x04,
-            0x83.toByte(), 0xBC.toByte(), 0x13,  // Identifier/timestamp
-            0x0D, 0xBB.toByte(), 0xA2.toByte(), 0x14,  // Position data or parameters
+            0x83.toByte(), 0xBC.toByte(), 0x13,
+            0x0D, 0xBB.toByte(), 0xA2.toByte(), 0x14,
             0x06, 0xC3.toByte(), 0x98.toByte(), 0xEB.toByte(),
-            0x43, 0x90.toByte(), 0x9D.toByte(), 0xFF.toByte(), 0xFF.toByte(),
-            0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x03
+            0x43, 0x90.toByte(),
+            // Continuation data
+            0x90.toByte(), 0x9D.toByte(), 0xFF.toByte(), 0xFF.toByte(),
+            0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x03,
+            0xE5.toByte(), 0x71, 0x00  // CRC=E571, terminator=00
         )
-        val psPayload = ByteArray(1 + posSubscribe.size)
+        val psPayload = ByteArray(1 + posSubscribeFull.size)
         psPayload[0] = 0x00
-        System.arraycopy(posSubscribe, 0, psPayload, 1, posSubscribe.size)
-        allPayloads.add("PosSubscribe_02_1D_01_04" to psPayload)
+        System.arraycopy(posSubscribeFull, 0, psPayload, 1, posSubscribeFull.size)
+        allPayloads.add("PosSubscribe_02_1D_01_04_FULL" to psPayload)
 
-        // Then: Send 02 1D 04 2B for slots 0x02 and 0x03
-        for ((idx, slot) in listOf(0x02, 0x03).withIndex()) {
-            val seqByte = 0x85 + idx  // 85, 86
-            val posQueryCmd = byteArrayOf(
-                0x02, 0x1D, 0x04, 0x2B,
-                seqByte.toByte(),
-                slot.toByte(),
-                0x01, 0x01, 0x01, 0x01,
-                0x02, 0x09, 0x01, 0x01, 0x02, 0x09, 0x01
-            )
-            val pqPayload = ByteArray(1 + posQueryCmd.size)
-            pqPayload[0] = 0x00
-            System.arraycopy(posQueryCmd, 0, pqPayload, 1, posQueryCmd.size)
-            allPayloads.add("PosQuery_02_1D_slot${"%02x".format(slot)}" to pqPayload)
-        }
+        // Slot 02: Full command with continuation + CRC (31 bytes, seq=85)
+        val posQuery2Full = byteArrayOf(
+            0x02, 0x1D, 0x04, 0x2B,
+            0x85.toByte(), 0x02,  // seq=85, slot=02
+            0x01, 0x01, 0x01, 0x01,
+            0x02, 0x09, 0x01, 0x01, 0x02, 0x09, 0x01,
+            // Continuation: different protobuf params for slot 02
+            0x01, 0x0C, 0xDA.toByte(), 0x02, 0x06, 0x4A, 0x04, 0x32, 0x02, 0x08, 0x03,
+            0xF6.toByte(), 0x79, 0x00  // CRC=F679, terminator=00
+        )
+        val pq2Payload = ByteArray(1 + posQuery2Full.size)
+        pq2Payload[0] = 0x00
+        System.arraycopy(posQuery2Full, 0, pq2Payload, 1, posQuery2Full.size)
+        allPayloads.add("PosQuery_02_1D_slot02_FULL" to pq2Payload)
+
+        // Slot 03: Full command with continuation + CRC (31 bytes, seq=86)
+        val posQuery3Full = byteArrayOf(
+            0x02, 0x1D, 0x04, 0x2B,
+            0x86.toByte(), 0x03,  // seq=86, slot=03
+            0x01, 0x01, 0x01, 0x01,
+            0x02, 0x09, 0x01, 0x01, 0x02, 0x09, 0x01,
+            // Continuation: same protobuf params as slot 02 but different CRC
+            0x01, 0x0C, 0xDA.toByte(), 0x02, 0x06, 0x4A, 0x04, 0x32, 0x02, 0x08, 0x03,
+            0xDF.toByte(), 0x1A, 0x00  // CRC=DF1A, terminator=00
+        )
+        val pq3Payload = ByteArray(1 + posQuery3Full.size)
+        pq3Payload[0] = 0x00
+        System.arraycopy(posQuery3Full, 0, pq3Payload, 1, posQuery3Full.size)
+        allPayloads.add("PosQuery_02_1D_slot03_FULL" to pq3Payload)
 
         // 6. Enable streaming (02 06)
         val enableStreaming = byteArrayOf(0x02, 0x06, 0x05, 0x1f,
@@ -1247,28 +1267,39 @@ class BleTrackingService : Service() {
 
         // After 02_08 burst, send 02_1D position query burst - CRITICAL for position streaming!
         // Garmin Explore sends these during init; without them, no 02_3C/02_7A position data flows.
-        val posQuerySlots = listOf(0x01, 0x02, 0x03)
-        Log.i(TAG, "Sending 02_1D position query burst (${posQuerySlots.size} commands)")
-        for ((idx, slot) in posQuerySlots.withIndex()) {
+        // FULL 02_1D position query burst with continuation data + CRC
+        // Using exact Garmin format: command + protobuf extension + CRC + 00
+        val fullPosQueries = listOf(
+            // Slot 01 (seq=84): continuation EA 01 06 0A 04 0A 02 10 0B, CRC=E37B
+            byteArrayOf(configPrefix, 0x00,
+                0x02, 0x1D, 0x04, 0x2B, 0x84.toByte(), 0x01,
+                0x01, 0x01, 0x01, 0x01, 0x02, 0x09, 0x01, 0x01, 0x02, 0x09, 0x01,
+                0x01, 0x0C, 0xEA.toByte(), 0x01, 0x06, 0x0A, 0x04, 0x0A, 0x02, 0x10, 0x0B,
+                0xE3.toByte(), 0x7B, 0x00),
+            // Slot 02 (seq=85): continuation DA 02 06 4A 04 32 02 08 03, CRC=F679
+            byteArrayOf(configPrefix, 0x00,
+                0x02, 0x1D, 0x04, 0x2B, 0x85.toByte(), 0x02,
+                0x01, 0x01, 0x01, 0x01, 0x02, 0x09, 0x01, 0x01, 0x02, 0x09, 0x01,
+                0x01, 0x0C, 0xDA.toByte(), 0x02, 0x06, 0x4A, 0x04, 0x32, 0x02, 0x08, 0x03,
+                0xF6.toByte(), 0x79, 0x00),
+            // Slot 03 (seq=86): continuation DA 02 06 4A 04 32 02 08 03, CRC=DF1A
+            byteArrayOf(configPrefix, 0x00,
+                0x02, 0x1D, 0x04, 0x2B, 0x86.toByte(), 0x03,
+                0x01, 0x01, 0x01, 0x01, 0x02, 0x09, 0x01, 0x01, 0x02, 0x09, 0x01,
+                0x01, 0x0C, 0xDA.toByte(), 0x02, 0x06, 0x4A, 0x04, 0x32, 0x02, 0x08, 0x03,
+                0xDF.toByte(), 0x1A, 0x00)
+        )
+        Log.i(TAG, "Sending FULL 02_1D position query burst (${fullPosQueries.size} commands with continuation)")
+        for ((idx, cmd) in fullPosQueries.withIndex()) {
             bleHandler.postDelayed({
                 val g = bluetoothGatt
                 if (g == null) {
                     Log.e(TAG, "PosQuery ${idx + 1}: gatt is null!")
                     return@postDelayed
                 }
-                // 02 1D 04 2B [seq] [slot] 01 01 01 01 02 09 01 01 02 09 01
-                val seqByte = (0x84 + idx).toByte()
-                val cmd = byteArrayOf(
-                    configPrefix, 0x00,
-                    0x02, 0x1D, 0x04, 0x2B,
-                    seqByte,
-                    slot.toByte(),
-                    0x01, 0x01, 0x01, 0x01,
-                    0x02, 0x09, 0x01, 0x01, 0x02, 0x09, 0x01
-                )
-                Log.i(TAG, "PosQuery ${idx + 1}/${posQuerySlots.size} slot 0x${"%02x".format(slot)}: ${cmd.toHexString()}")
-                sendCommandLogged(g, characteristic, cmd, "PosQuery slot 0x${"%02x".format(slot)}")
-            }, (5 * 250 + 500 + idx * 250).toLong())  // After 02_08 burst + 500ms gap
+                Log.i(TAG, "PosQuery FULL ${idx + 1}/${fullPosQueries.size} (${cmd.size}B): ${cmd.toHexString()}")
+                sendCommandLogged(g, characteristic, cmd, "PosQuery FULL slot ${idx + 1}")
+            }, (5 * 250 + 500 + idx * 250).toLong())
         }
 
         pollingRunnable = object : Runnable {
@@ -1314,20 +1345,33 @@ class BleTrackingService : Service() {
                             cmdToSend = buildPollingCommand(configPrefix)
                             cmdDesc = "Poll config 02_08"
                         }
-                        // Every 7th tick (~14 seconds): position query 02_1D
-                        // This is CRITICAL for keeping position data flowing!
+                        // Every 7th tick (~14 seconds): FULL position query 02_1D with continuation
+                        // Uses fixed seq/CRC from Garmin capture (seq varies per slot: 84/85/86)
                         pollingTickCount % 7 == 0 -> {
-                            val slot = 0x01 + (pollingTickCount / 7) % 3  // Cycle slots 01, 02, 03
-                            val seqByte = (0x90 + (pollingTickCount and 0x0F)).toByte()
-                            cmdToSend = byteArrayOf(
-                                configPrefix, 0x00,
-                                0x02, 0x1D, 0x04, 0x2B,
-                                seqByte,
-                                slot.toByte(),
-                                0x01, 0x01, 0x01, 0x01,
-                                0x02, 0x09, 0x01, 0x01, 0x02, 0x09, 0x01
+                            val slotIdx = (pollingTickCount / 7) % 3  // 0, 1, 2
+                            // Full commands with protobuf continuation + CRC (exact Garmin bytes)
+                            val fullCmds = arrayOf(
+                                // Slot 01 (seq=84)
+                                byteArrayOf(configPrefix, 0x00,
+                                    0x02, 0x1D, 0x04, 0x2B, 0x84.toByte(), 0x01,
+                                    0x01, 0x01, 0x01, 0x01, 0x02, 0x09, 0x01, 0x01, 0x02, 0x09, 0x01,
+                                    0x01, 0x0C, 0xEA.toByte(), 0x01, 0x06, 0x0A, 0x04, 0x0A, 0x02, 0x10, 0x0B,
+                                    0xE3.toByte(), 0x7B, 0x00),
+                                // Slot 02 (seq=85)
+                                byteArrayOf(configPrefix, 0x00,
+                                    0x02, 0x1D, 0x04, 0x2B, 0x85.toByte(), 0x02,
+                                    0x01, 0x01, 0x01, 0x01, 0x02, 0x09, 0x01, 0x01, 0x02, 0x09, 0x01,
+                                    0x01, 0x0C, 0xDA.toByte(), 0x02, 0x06, 0x4A, 0x04, 0x32, 0x02, 0x08, 0x03,
+                                    0xF6.toByte(), 0x79, 0x00),
+                                // Slot 03 (seq=86)
+                                byteArrayOf(configPrefix, 0x00,
+                                    0x02, 0x1D, 0x04, 0x2B, 0x86.toByte(), 0x03,
+                                    0x01, 0x01, 0x01, 0x01, 0x02, 0x09, 0x01, 0x01, 0x02, 0x09, 0x01,
+                                    0x01, 0x0C, 0xDA.toByte(), 0x02, 0x06, 0x4A, 0x04, 0x32, 0x02, 0x08, 0x03,
+                                    0xDF.toByte(), 0x1A, 0x00)
                             )
-                            cmdDesc = "Pos query 02_1D slot 0x${"%02x".format(slot)}"
+                            cmdToSend = fullCmds[slotIdx]
+                            cmdDesc = "Pos query 02_1D FULL slot ${slotIdx + 1}"
                         }
                         // Every 5th tick (~10 seconds): collar slot re-registration
                         pollingTickCount % 5 == 0 -> {
