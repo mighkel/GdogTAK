@@ -1236,6 +1236,11 @@ class BleTrackingService : Service() {
 
             bleHandler.postDelayed({
                 Log.i(TAG, "Init sequence complete! (${initMessages.size} messages with group rotation)")
+                // Set fragment state for polling phase - continue from where init left off
+                // Init ended at group 3, seq 0x0A (last message was CollarSlot3)
+                fragmentGroup = 4  // next group after init's 0-3
+                fragmentSeq = 0x0B  // next seq after init's 0x0A
+                Log.i(TAG, "Fragment state for polling: group=$fragmentGroup, seq=0x${"%02X".format(fragmentSeq)}")
                 Log.i(TAG, "Starting polling on char1 (matching Garmin Explore)")
                 startPeriodicPolling(gatt, characteristic)
                 updateStatus(Status.TRACKING, "Tracking active")
@@ -1376,8 +1381,9 @@ class BleTrackingService : Service() {
                     return@postDelayed
                 }
                 val cmd = buildPollingCommand(configPrefix)
-                Log.i(TAG, "Poll burst ${i + 1}/5: ${cmd.toHexString()}")
-                sendCommandLogged(g, characteristic, cmd, "Poll burst ${i + 1}")
+                val fragged = wrapFragmented(cmd)
+                Log.i(TAG, "Poll burst ${i + 1}/5: ${fragged.toHexString()}")
+                sendCommandLogged(g, characteristic, fragged, "Poll burst ${i + 1}")
             }, (i * 250).toLong())
         }
 
@@ -1413,8 +1419,9 @@ class BleTrackingService : Service() {
                     Log.e(TAG, "PosQuery ${idx + 1}: gatt is null!")
                     return@postDelayed
                 }
-                Log.i(TAG, "PosQuery FULL ${idx + 1}/${fullPosQueries.size} (${cmd.size}B): ${cmd.toHexString()}")
-                sendCommandLogged(g, characteristic, cmd, "PosQuery FULL slot ${idx + 1}")
+                val fragged = wrapFragmented(cmd)
+                Log.i(TAG, "PosQuery FULL ${idx + 1}/${fullPosQueries.size} (${fragged.size}B): ${fragged.toHexString()}")
+                sendCommandLogged(g, characteristic, fragged, "PosQuery FULL slot ${idx + 1}")
             }, (5 * 250 + 500 + idx * 250).toLong())
         }
 
@@ -1517,7 +1524,8 @@ class BleTrackingService : Service() {
                     } else {
                         Log.i(TAG, "Poll #$pollingTickCount: $cmdDesc (${cmdToSend.size}B) ${cmdToSend.copyOf(minOf(6, cmdToSend.size)).toHexString()}")
                     }
-                    sendCommandLogged(g, characteristic, cmdToSend, cmdDesc)
+                    val fragCmd = wrapFragmented(cmdToSend)
+                    sendCommandLogged(g, characteristic, fragCmd, cmdDesc)
                 } catch (e: Exception) {
                     Log.e(TAG, "Periodic polling error", e)
                 }
@@ -1558,6 +1566,34 @@ class BleTrackingService : Service() {
         } catch (e: Exception) {
             Log.e(TAG, ">>> WRITE $desc: Exception", e)
         }
+    }
+
+    /**
+     * Wrap a command in Garmin fragment headers for the polling phase.
+     *
+     * Garmin Explore wraps ALL post-init commands in fragment headers:
+     *   Input:  [configPrefix][0x00][cmd...]  (channel-prefix format)
+     *   Output: [base+group][seq][0x00][cmd...]  (fragment-header format)
+     *
+     * The Alpha ignores commands without fragment headers after init!
+     * Fragment group rotates 0-15, seq increments 0-63 then wraps.
+     */
+    private fun wrapFragmented(cmd: ByteArray): ByteArray {
+        val grpByte = (fragmentBase + (fragmentGroup and 0x0F)).toByte()
+        val seqByte = (fragmentSeq and 0x3F).toByte()
+
+        // Replace [configPrefix] with [base+group][seq], keeping [0x00][cmd...] from position 1
+        val wrapped = ByteArray(cmd.size + 1)
+        wrapped[0] = grpByte
+        wrapped[1] = seqByte
+        System.arraycopy(cmd, 1, wrapped, 2, cmd.size - 1)
+
+        // Advance fragment counters
+        fragmentSeq++
+        if (fragmentSeq > 0x3F) fragmentSeq = 0
+        fragmentGroup = (fragmentGroup + 1) and 0x0F  // rotate every message
+
+        return wrapped
     }
 
     /** Build 02_08 polling command with channel prefix */
