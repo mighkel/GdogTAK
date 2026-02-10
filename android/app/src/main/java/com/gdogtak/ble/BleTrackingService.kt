@@ -1075,44 +1075,29 @@ class BleTrackingService : Service() {
 
         Log.d(TAG, "Device reg payload: ${deviceRegPayload.size} bytes, will fragment")
         
-        // Config commands - raw payloads without prefix (fragmentation adds its own header)
-        // Fragmented protocol: payload starts with 0x00 then command (02 XX ...)
-        val configCommandsRaw = listOf(
-            // Position subscribe: 02 09 01 04 81 ba 13 03 9d e9 00
-            byteArrayOf(0x02, 0x09, 0x01, 0x04,
-                0x81.toByte(), 0xba.toByte(), 0x13, 0x03, 0x9d.toByte(), 0xe9.toByte(), 0x00),
-            // Config 0x16 - matches Alpha's registration
-            byteArrayOf(0x02, 0x16, 0x06, 0x32,
-                0x80.toByte(), 0x0f, 0x50, 0x06, 0x02, 0x14, 0x01, 0x02, 0x04, 0x06,
-                0xa0.toByte(), 0x20, 0x13, 0x1d, 0x49, 0x04, 0x01, 0xa0.toByte(), 0x47, 0x00)
-        )
-        
-        // Build payloads for fragmented messages - each starts with 0x00 then command
-        // MINIMAL INIT - match Garmin's exact sequence before position data flows:
-        // 1. Device registration (02 44)
-        // 2. Position subscribe (02 09)
-        // 3. Config (02 16)
-        // 4. Device list query (02 52)
-        // 5. ONE collar slot (02 11) - just one, like Garmin!
-        // 6. Enable streaming (02 06)
-        // 7. Polling config (02 08)
-        // Position data should start flowing after these commands!
+        // ============================================================
+        // EXACT GARMIN INIT SEQUENCE - matched byte-for-byte from btsnoop
+        // ============================================================
+        // Garmin Explore uses SPECIFIC fragment headers with group rotation:
+        //   Group 0 (base+0): 02_44, 02_09, 02_16, marker+02_52
+        //   Group 1 (base+1): 02_11, 02_06, 02_08
+        //   Group 2 (base+2): 02_1D position query
+        //   Group 3 (base+3): 02_1D subscribe, 02_11, 02_11
+        // Previously we used sendFragmented() with NO group rotation - Alpha rejected it.
 
-        val allPayloads = mutableListOf<Pair<String, ByteArray>>()
+        // --- Payload definitions (each starts with 0x00 channel byte) ---
 
-        // 1. Device registration
-        allPayloads.add("DeviceReg" to deviceRegPayload)
+        // Config 02_09 - position subscribe config
+        val config09Payload = byteArrayOf(0x00, 0x02, 0x09, 0x01, 0x04,
+            0x81.toByte(), 0xba.toByte(), 0x13, 0x03, 0x9d.toByte(), 0xe9.toByte(), 0x00)
 
-        // 2-3. Config commands
-        for (cmd in configCommandsRaw) {
-            val payload = ByteArray(1 + cmd.size)
-            payload[0] = 0x00
-            System.arraycopy(cmd, 0, payload, 1, cmd.size)
-            allPayloads.add("Config_02_${"%02x".format(cmd[1])}" to payload)
-        }
+        // Config 02_16 - FIXED: byte at offset 14 = 0xA2 (was 0xA0), CRC=8387 (was A047)
+        val config16Payload = byteArrayOf(0x00, 0x02, 0x16, 0x06, 0x32,
+            0x80.toByte(), 0x0f, 0x50, 0x06, 0x02, 0x14, 0x01, 0x02, 0x04, 0x06,
+            0xa2.toByte(), 0x20, 0x13, 0x1d, 0x49, 0x04, 0x01, 0x83.toByte(), 0x87.toByte(), 0x00)
 
-        // 4. Device list query (must come before collar slot per btsnoop)
-        val deviceListQuery = byteArrayOf(0x02, 0x52, 0x03, 0x2b, 0x81.toByte(),
+        // Device list query 02_52
+        val deviceList52Payload = byteArrayOf(0x00, 0x02, 0x52, 0x03, 0x2b, 0x81.toByte(),
             0x01, 0x01, 0x01, 0x01, 0x01, 0x02, 0x3e, 0x01, 0x01, 0x02, 0x3e,
             0x01, 0x01, 0x32, 0x6a, 0x3c, 0x42, 0x3a, 0x0a, 0x24,
             0x34, 0x37, 0x31, 0x65, 0x39, 0x35, 0x39, 0x30, 0x2d, 0x38, 0x36,
@@ -1121,125 +1106,137 @@ class BleTrackingService : Service() {
             0x30, 0x39, 0x37,
             0x6a, 0x02, 0x08, 0x02, 0x72, 0x02, 0x08, 0x05, 0xb2.toByte(), 0x01, 0x02, 0x08, 0x0a,
             0xc2.toByte(), 0x01, 0x04, 0x08, 0x01, 0x10, 0x01, 0xfb.toByte(), 0xd3.toByte(), 0x00)
-        val dlPayload = ByteArray(1 + deviceListQuery.size)
-        dlPayload[0] = 0x00
-        System.arraycopy(deviceListQuery, 0, dlPayload, 1, deviceListQuery.size)
-        allPayloads.add("DeviceList_02_52" to dlPayload)
 
-        // 5. ONE collar slot registration (slot 0x82 like Garmin)
-        // Garmin sends: 02 11 01 04 82 B4 13 01 01 01 01 01 01 01 01 03 [checksum]
-        val singleCollarSlot = GarminProtocol.buildCollarSlotPacket(0x82, seqHi = 0x01, seqLo = 0x01)
-        val csPayload = ByteArray(1 + singleCollarSlot.size)
-        csPayload[0] = 0x00
-        System.arraycopy(singleCollarSlot, 0, csPayload, 1, singleCollarSlot.size)
-        allPayloads.add("CollarSlot_0x82" to csPayload)
+        // Collar slot 1 (02_11, slot 0x82)
+        val collarSlot1Raw = GarminProtocol.buildCollarSlotPacket(0x82, seqHi = 0x01, seqLo = 0x01)
+        val collarSlot1Payload = ByteArray(1 + collarSlot1Raw.size)
+        collarSlot1Payload[0] = 0x00
+        System.arraycopy(collarSlot1Raw, 0, collarSlot1Payload, 1, collarSlot1Raw.size)
 
-        // 5b. Position query commands (02 1D) - CRITICAL for position streaming!
-        // IMPORTANT: Garmin Explore sends FULL commands with protobuf continuation data + CRC.
-        // Previously we sent SHORT commands without the continuation - Alpha ignores those!
-        // Each 02_1D 04 2B command needs 31 bytes (not 17) = requires 2 BLE fragments.
-        // Using exact byte sequences captured from working Garmin Explore session.
+        // Enable streaming 02_06
+        val enableStreamPayload = byteArrayOf(0x00, 0x02, 0x06, 0x05, 0x1f,
+            0x82.toByte(), 0x88.toByte(), 0xd9.toByte(), 0x00)
 
-        // Slot 01: Full command with continuation + CRC (31 bytes, seq=84)
-        val posQuery1Full = byteArrayOf(
+        // Polling config 02_08
+        val pollingCfgPayload = byteArrayOf(0x00, 0x02, 0x08, 0x04, 0x1e,
+            0x83.toByte(), 0x08, 0x03, 0xf1.toByte(), 0x48, 0x00)
+
+        // Position query 02_1D 04 2B (slot 01, full 31-byte command with protobuf + CRC)
+        val posQueryPayload = byteArrayOf(0x00,
             0x02, 0x1D, 0x04, 0x2B,
-            0x84.toByte(), 0x01,  // seq=84, slot=01
+            0x84.toByte(), 0x01,
             0x01, 0x01, 0x01, 0x01,
             0x02, 0x09, 0x01, 0x01, 0x02, 0x09, 0x01,
-            // Continuation: protobuf subscription params + CRC + terminator
             0x01, 0x0C, 0xEA.toByte(), 0x01, 0x06, 0x0A, 0x04, 0x0A, 0x02, 0x10, 0x0B,
-            0xE3.toByte(), 0x7B, 0x00  // CRC=E37B, terminator=00
-        )
-        val pq1Payload = ByteArray(1 + posQuery1Full.size)
-        pq1Payload[0] = 0x00
-        System.arraycopy(posQuery1Full, 0, pq1Payload, 1, posQuery1Full.size)
-        allPayloads.add("PosQuery_02_1D_slot01_FULL" to pq1Payload)
+            0xE3.toByte(), 0x7B, 0x00)
 
-        // 02 1D 01 04 variant - position subscription (from Garmin btsnoop)
-        // Full assembled: 02 1D 01 04 83 BC 13 0D BB A2 14 06 C3 98 EB 43 90
-        //                  90 9D FF FF 01 01 01 01 01 01 01 03 E5 71 00
-        val posSubscribeFull = byteArrayOf(
+        // Position subscribe 02_1D 01 04 (full command with protobuf + CRC)
+        val posSubPayload = byteArrayOf(0x00,
             0x02, 0x1D, 0x01, 0x04,
             0x83.toByte(), 0xBC.toByte(), 0x13,
             0x0D, 0xBB.toByte(), 0xA2.toByte(), 0x14,
             0x06, 0xC3.toByte(), 0x98.toByte(), 0xEB.toByte(),
             0x43, 0x90.toByte(),
-            // Continuation data
             0x90.toByte(), 0x9D.toByte(), 0xFF.toByte(), 0xFF.toByte(),
             0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x03,
-            0xE5.toByte(), 0x71, 0x00  // CRC=E571, terminator=00
+            0xE5.toByte(), 0x71, 0x00)
+
+        // Collar slots 2 and 3 (02_11, slots 0x83 and 0x84) - Garmin sends these after pos subscribe
+        val collarSlot2Raw = GarminProtocol.buildCollarSlotPacket(0x83, seqHi = 0x01, seqLo = 0x02)
+        val collarSlot2Payload = ByteArray(1 + collarSlot2Raw.size)
+        collarSlot2Payload[0] = 0x00
+        System.arraycopy(collarSlot2Raw, 0, collarSlot2Payload, 1, collarSlot2Raw.size)
+
+        val collarSlot3Raw = GarminProtocol.buildCollarSlotPacket(0x84, seqHi = 0x01, seqLo = 0x03)
+        val collarSlot3Payload = ByteArray(1 + collarSlot3Raw.size)
+        collarSlot3Payload[0] = 0x00
+        System.arraycopy(collarSlot3Raw, 0, collarSlot3Payload, 1, collarSlot3Raw.size)
+
+        // --- Init messages with EXACT Garmin fragment headers from btsnoop ---
+        // Each entry: (groupOffset, seqByte, payload or null for marker, description)
+        // Group rotation: base+0, base+1, base+2, base+3
+        // Seq bytes: 0x40=start marker, 0x80=final flag, 0xC0=start+final
+        data class InitMsg(val grpOff: Int, val seq: Int, val data: ByteArray?, val desc: String)
+
+        val initMessages = listOf(
+            // GROUP 0: device reg, configs, device list
+            InitMsg(0, 0x40, null, "Marker_02_44"),
+            InitMsg(0, 0x40, deviceRegPayload, "DeviceReg_02_44"),
+            InitMsg(0, 0x81, config09Payload, "Config_02_09"),
+            InitMsg(0, 0x82, config16Payload, "Config_02_16"),
+            InitMsg(0, 0xC0, null, "Marker_02_52"),
+            InitMsg(0, 0xC3, deviceList52Payload, "DeviceList_02_52"),
+            // GROUP 1: collar slot, enable streaming, polling config
+            InitMsg(1, 0x44, collarSlot1Payload, "CollarSlot1_02_11"),
+            InitMsg(1, 0x45, enableStreamPayload, "EnableStream_02_06"),
+            InitMsg(1, 0x86, pollingCfgPayload, "PollingCfg_02_08"),
+            // GROUP 2: position query
+            InitMsg(2, 0x87, posQueryPayload, "PosQuery_02_1D"),
+            // GROUP 3: position subscribe + extra collar slots
+            InitMsg(3, 0x08, posSubPayload, "PosSub_02_1D"),
+            InitMsg(3, 0x09, collarSlot2Payload, "CollarSlot2_02_11"),
+            InitMsg(3, 0x0A, collarSlot3Payload, "CollarSlot3_02_11"),
         )
-        val psPayload = ByteArray(1 + posSubscribeFull.size)
-        psPayload[0] = 0x00
-        System.arraycopy(posSubscribeFull, 0, psPayload, 1, posSubscribeFull.size)
-        allPayloads.add("PosSubscribe_02_1D_01_04_FULL" to psPayload)
 
-        // Slot 02: Full command with continuation + CRC (31 bytes, seq=85)
-        val posQuery2Full = byteArrayOf(
-            0x02, 0x1D, 0x04, 0x2B,
-            0x85.toByte(), 0x02,  // seq=85, slot=02
-            0x01, 0x01, 0x01, 0x01,
-            0x02, 0x09, 0x01, 0x01, 0x02, 0x09, 0x01,
-            // Continuation: different protobuf params for slot 02
-            0x01, 0x0C, 0xDA.toByte(), 0x02, 0x06, 0x4A, 0x04, 0x32, 0x02, 0x08, 0x03,
-            0xF6.toByte(), 0x79, 0x00  // CRC=F679, terminator=00
-        )
-        val pq2Payload = ByteArray(1 + posQuery2Full.size)
-        pq2Payload[0] = 0x00
-        System.arraycopy(posQuery2Full, 0, pq2Payload, 1, posQuery2Full.size)
-        allPayloads.add("PosQuery_02_1D_slot02_FULL" to pq2Payload)
-
-        // Slot 03: Full command with continuation + CRC (31 bytes, seq=86)
-        val posQuery3Full = byteArrayOf(
-            0x02, 0x1D, 0x04, 0x2B,
-            0x86.toByte(), 0x03,  // seq=86, slot=03
-            0x01, 0x01, 0x01, 0x01,
-            0x02, 0x09, 0x01, 0x01, 0x02, 0x09, 0x01,
-            // Continuation: same protobuf params as slot 02 but different CRC
-            0x01, 0x0C, 0xDA.toByte(), 0x02, 0x06, 0x4A, 0x04, 0x32, 0x02, 0x08, 0x03,
-            0xDF.toByte(), 0x1A, 0x00  // CRC=DF1A, terminator=00
-        )
-        val pq3Payload = ByteArray(1 + posQuery3Full.size)
-        pq3Payload[0] = 0x00
-        System.arraycopy(posQuery3Full, 0, pq3Payload, 1, posQuery3Full.size)
-        allPayloads.add("PosQuery_02_1D_slot03_FULL" to pq3Payload)
-
-        // 6. Enable streaming (02 06)
-        val enableStreaming = byteArrayOf(0x02, 0x06, 0x05, 0x1f,
-            0x82.toByte(), 0x88.toByte(), 0xd9.toByte(), 0x00)
-        val esPayload = ByteArray(1 + enableStreaming.size)
-        esPayload[0] = 0x00
-        System.arraycopy(enableStreaming, 0, esPayload, 1, enableStreaming.size)
-        allPayloads.add("EnableStreaming_02_06" to esPayload)
-
-        // 7. Polling config (02 08)
-        val pollingConfig = byteArrayOf(0x02, 0x08, 0x04, 0x1e,
-            0x83.toByte(), 0x08, 0x03, 0xf1.toByte(), 0x48, 0x00)
-        val pcPayload = ByteArray(1 + pollingConfig.size)
-        pcPayload[0] = 0x00
-        System.arraycopy(pollingConfig, 0, pcPayload, 1, pollingConfig.size)
-        allPayloads.add("PollingConfig_02_08" to pcPayload)
-
-        Log.d(TAG, "MINIMAL INIT: ${allPayloads.size} payloads (matching Garmin sequence)")
+        Log.d(TAG, "GARMIN INIT: ${initMessages.size} messages with exact fragment headers (base=0x${"%02X".format(fragmentBase)})")
 
         try {
             characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
 
-            // Send all payloads using fragmentation
+            // Send each message with EXACT Garmin fragment headers
+            // No sendFragmented() - direct writes with pre-computed headers
             var delay = 0L
-            for ((name, payload) in allPayloads) {
-                delay = sendFragmented(gatt, characteristic, payload, name, delay)
-                delay += 100L  // Gap between messages
-            }
-            
-            bleHandler.postDelayed({
-                Log.i(TAG, "Init sequence on char1 complete!")
+            for (msg in initMessages) {
+                val groupByte = (fragmentBase + msg.grpOff).toByte()
+                val seqByte = msg.seq.toByte()
+                val d = delay
 
-                // CRITICAL: Garmin Explore does ALL init and initial polling on char1 (0x0029).
-                // It doesn't touch char2 (0x001A) until 4+ minutes AFTER position data is flowing!
-                // Previously we were starting second init on char2 immediately - this was wrong.
-                // Now we skip second init entirely and poll on char1 like Garmin does.
-                Log.i(TAG, "Starting polling on char1 (matching Garmin Explore behavior)")
+                if (msg.data == null) {
+                    // Marker: 2 bytes [group][seq]
+                    val marker = byteArrayOf(groupByte, seqByte)
+                    bleHandler.postDelayed({
+                        Log.i(TAG, ">>> MARKER ${msg.desc}: ${marker.toHexString()}")
+                        try {
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                gatt.writeCharacteristic(characteristic, marker, BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE)
+                            } else {
+                                @Suppress("DEPRECATION")
+                                characteristic.value = marker
+                                @Suppress("DEPRECATION")
+                                gatt.writeCharacteristic(characteristic)
+                            }
+                        } catch (e: SecurityException) {
+                            Log.e(TAG, "Marker failed: ${msg.desc}", e)
+                        }
+                    }, d)
+                } else {
+                    // Data: [group][seq][payload]
+                    val packet = ByteArray(2 + msg.data.size)
+                    packet[0] = groupByte
+                    packet[1] = seqByte
+                    System.arraycopy(msg.data, 0, packet, 2, msg.data.size)
+                    bleHandler.postDelayed({
+                        Log.i(TAG, ">>> WRITE ${msg.desc}: ${packet.size}B [${"%02X".format(groupByte)}][${"%02X".format(seqByte)}]")
+                        try {
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                gatt.writeCharacteristic(characteristic, packet, BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE)
+                            } else {
+                                @Suppress("DEPRECATION")
+                                characteristic.value = packet
+                                @Suppress("DEPRECATION")
+                                gatt.writeCharacteristic(characteristic)
+                            }
+                        } catch (e: SecurityException) {
+                            Log.e(TAG, "Write failed: ${msg.desc}", e)
+                        }
+                    }, d)
+                }
+                delay += 50L
+            }
+
+            bleHandler.postDelayed({
+                Log.i(TAG, "Init sequence complete! (${initMessages.size} messages with group rotation)")
+                Log.i(TAG, "Starting polling on char1 (matching Garmin Explore)")
                 startPeriodicPolling(gatt, characteristic)
                 updateStatus(Status.TRACKING, "Tracking active")
             }, delay)
@@ -1646,8 +1643,9 @@ class BleTrackingService : Service() {
 
         // Body from BR5 capture - the bulk 02_35 pattern (05 2c variant)
         // Bytes 5-6 are rolling counters that we increment each call
+        // NOTE: No leading 0x00 here - the channel byte is added below as cmd[1]
         val header = byteArrayOf(
-            0x00, 0x02, 0x35, 0x05, 0x2c,
+            0x02, 0x35, 0x05, 0x2c,
             relaySeqHi, relaySeqLo,
             0x0f, 0x01, 0x01, 0x01,
             0x02, 0x21, 0x01, 0x01, 0x02, 0x21, 0x01, 0x01,
